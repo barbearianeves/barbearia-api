@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import deque
@@ -8,6 +7,9 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
+
+# ✅ NOVO: token para o barbeiro (configura no Render -> Environment)
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")
 
 # Estado central (memória) — no free tier reinicia se dormir (ok p/ já)
 BOOKINGS = {}  # id -> booking dict
@@ -28,6 +30,11 @@ def push_change(op, payload):
         "payload": payload, # booking ou {"id":...}
         "ts": int(time.time())
     })
+
+
+# ✅ NOVO: valida admin
+def is_admin(req):
+    return req.headers.get("X-Admin-Token", "") == ADMIN_TOKEN
 
 
 @app.get("/")
@@ -158,6 +165,59 @@ def day():
     date = request.args.get("date", "")
     barber = request.args.get("barber", "")
     return jsonify({"ok": True, "items": _busy_items(date, barber)})
+
+
+# ==========================
+# ✅ NOVO: ENDPOINTS ADMIN
+# ==========================
+
+@app.get("/admin/bookings")
+def admin_list():
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    date = (request.args.get("date") or "").strip()
+    barber = (request.args.get("barber") or "").strip()
+
+    out = []
+    for b in BOOKINGS.values():
+        if date and b.get("date") != date:
+            continue
+        if barber and b.get("barber") != barber:
+            continue
+        out.append(b)
+
+    out.sort(key=lambda x: x.get("time", ""))
+    return jsonify({"ok": True, "items": out})
+
+
+@app.patch("/admin/bookings/<bid>")
+def admin_patch(bid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    if bid not in BOOKINGS:
+        return bad("not found", 404)
+
+    data = request.get_json(silent=True) or {}
+    BOOKINGS[bid] = {**BOOKINGS[bid], **data}
+
+    # importante: enviar mudança para a bridge
+    push_change("upsert", BOOKINGS[bid])
+    return jsonify({"ok": True})
+
+
+@app.delete("/admin/bookings/<bid>")
+def admin_delete(bid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    existed = bid in BOOKINGS
+    if existed:
+        BOOKINGS.pop(bid, None)
+        push_change("delete", {"id": bid})
+
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
