@@ -10,8 +10,8 @@ BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
 ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")
 
 # Estado central (memória)
-BOOKINGS = {}                 # id -> booking dict
-CHANGES  = deque(maxlen=20000)  # eventos para bridge
+BOOKINGS = {}                  # id -> booking dict
+CHANGES  = deque(maxlen=20000) # eventos para bridge
 
 
 def now_id():
@@ -151,7 +151,9 @@ def _busy_items(date: str = "", barber: str = ""):
             continue
         if barber and b.get("barber") != barber:
             continue
-        if b.get("status") == "Cancelado":
+
+        # ✅ cliente não deve bloquear slots cancelados nem "desbloqueados" (histórico)
+        if b.get("status") in ["Cancelado", "Desbloqueado"]:
             continue
 
         is_block = (b.get("status") == "Bloqueado") or (b.get("service") == "INDISPONIVEL")
@@ -161,7 +163,6 @@ def _busy_items(date: str = "", barber: str = ""):
             "time": b.get("time", ""),
             "dur": b.get("dur", 30),
             "status": b.get("status", "Marcado"),
-            # 👇 para o index mostrar a razão
             "label": "INDISPONÍVEL" if is_block else "OCUPADO",
             "service": b.get("service", ""),
             "notes": b.get("notes", "")
@@ -272,6 +273,29 @@ def admin_block():
     BOOKINGS[bid] = item
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
+
+
+# ==========================
+# ✅ ADMIN: DESBLOQUEAR (HISTÓRICO)
+# ==========================
+@app.post("/admin/unblock/<bid>")
+def admin_unblock(bid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    if bid not in BOOKINGS:
+        return bad("not found", 404)
+
+    # Em vez de apagar: mantém no histórico
+    BOOKINGS[bid]["status"] = "Desbloqueado"
+
+    # opcional: marcar nota automaticamente
+    n = (BOOKINGS[bid].get("notes") or "").strip()
+    if "desbloqueado" not in n.lower():
+        BOOKINGS[bid]["notes"] = (n + " | desbloqueado").strip(" |")
+
+    push_change("upsert", BOOKINGS[bid])
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
