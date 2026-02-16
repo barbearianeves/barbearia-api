@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import deque
-import os, time, secrets
+import os, time, secrets, json
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -9,30 +9,49 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
 ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")
 
-# Estado central (memória)
-BOOKINGS = {}                  # id -> booking dict
-CHANGES  = deque(maxlen=20000) # eventos para bridge
+# ✅ Persistência (Render Disk) — NÃO é base de dados
+DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json")
 
+BOOKINGS = {}                    # id -> booking dict (persistente)
+CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória, ok)
 
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
 
-
 def bad(msg, code=400):
     return jsonify({"error": msg}), code
 
-
 def push_change(op, payload):
     CHANGES.append({
-        "op": op,           # "upsert" | "delete"
-        "payload": payload, # booking ou {"id":...}
+        "op": op,
+        "payload": payload,
         "ts": int(time.time())
     })
-
 
 def is_admin(req):
     return req.headers.get("X-Admin-Token", "") == ADMIN_TOKEN
 
+def load_bookings():
+    global BOOKINGS
+    try:
+        if os.path.exists(BOOKINGS_FILE):
+            with open(BOOKINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            BOOKINGS = data if isinstance(data, dict) else {}
+        else:
+            BOOKINGS = {}
+    except:
+        BOOKINGS = {}
+
+def save_bookings():
+    tmp = BOOKINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(BOOKINGS, f, ensure_ascii=False)
+    os.replace(tmp, BOOKINGS_FILE)
+
+load_bookings()
 
 @app.get("/")
 def home():
@@ -40,9 +59,9 @@ def home():
         "ok": True,
         "service": "barbearia-api",
         "bookings": len(BOOKINGS),
-        "changes": len(CHANGES)
+        "changes": len(CHANGES),
+        "persist": BOOKINGS_FILE
     })
-
 
 # -------------------------
 # CLIENTE: CRIAR MARCAÇÃO
@@ -55,10 +74,7 @@ def book():
         if not str(data.get(k, "")).strip():
             return bad(f"Campo obrigatório em falta: {k}")
 
-    t = str(data["time"]).strip()
-    if len(t) >= 5:
-        t = t[:5]
-
+    t = str(data["time"]).strip()[:5]
     bid = data.get("id") or now_id()
 
     item = {
@@ -68,13 +84,13 @@ def book():
         "email": str(data.get("email", "")).strip(),
         "service": str(data.get("service", "")).strip(),
         "barber": str(data.get("barber", "")).strip(),
-        "date": str(data.get("date", "")).strip(),   # AAAA-MM-DD
-        "time": t,                                   # HH:MM
+        "date": str(data.get("date", "")).strip(),
+        "time": t,
         "dur": int(float(data.get("dur", 30))),
         "notes": str(data.get("notes", "")).strip(),
-        "status": str(data.get("status", "Marcado")).strip() or "Marcado",
+        "status": "Marcado",
 
-        # compat com bridge/C (se vier)
+        # compat bridge/C (se vier)
         "client_id": str(data.get("client_id", "")).strip(),
         "client": str(data.get("client", "")).strip(),
 
@@ -82,9 +98,9 @@ def book():
     }
 
     BOOKINGS[bid] = item
+    save_bookings()
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
-
 
 # -------------------------
 # BRIDGE: PULL / SYNC
@@ -104,7 +120,6 @@ def pull():
 
     return jsonify({"ok": True, "cursor": new_cursor, "items": out})
 
-
 @app.post("/sync")
 def sync():
     secret = request.args.get("secret", "")
@@ -120,31 +135,35 @@ def sync():
     for ch in changes:
         op = ch.get("op")
         payload = ch.get("payload") or {}
+        bid = payload.get("id")
+
+        if not bid:
+            continue
 
         if op == "delete":
-            bid = payload.get("id")
-            if bid:
-                existed = bid in BOOKINGS
-                BOOKINGS.pop(bid, None)
-                if existed:
-                    push_change("delete", {"id": bid})
-                applied += 1
+            # ⚠️ não usamos delete real no histórico (mas deixa compat se quiseres)
+            existed = bid in BOOKINGS
+            BOOKINGS.pop(bid, None)
+            if existed:
+                save_bookings()
+                push_change("delete", {"id": bid})
+            applied += 1
 
         elif op == "upsert":
-            bid = payload.get("id")
-            if not bid:
-                continue
             BOOKINGS[bid] = {**BOOKINGS.get(bid, {}), **payload}
+            save_bookings()
             push_change("upsert", BOOKINGS[bid])
             applied += 1
 
     return jsonify({"ok": True, "applied": applied})
 
-
 # -------------------------
 # CLIENTE: VER OCUPADOS/DIA
+# - só bloqueia se estiver mesmo ocupado/bloqueado
+# - ignora Cancelado e Desbloqueado (histórico)
+# - NÃO envia nomes/telefones (privacidade)
 # -------------------------
-def _busy_items(date: str = "", barber: str = ""):
+def _day_items_for_clients(date: str = "", barber: str = ""):
     out = []
     for b in BOOKINGS.values():
         if date and b.get("date") != date:
@@ -152,40 +171,36 @@ def _busy_items(date: str = "", barber: str = ""):
         if barber and b.get("barber") != barber:
             continue
 
-        # ✅ cliente não deve bloquear slots cancelados nem "desbloqueados" (histórico)
-        if b.get("status") in ["Cancelado", "Desbloqueado"]:
+        st = b.get("status", "Marcado")
+        if st in ["Cancelado", "Desbloqueado"]:
             continue
 
-        is_block = (b.get("status") == "Bloqueado") or (b.get("service") == "INDISPONIVEL")
-
+        is_block = (st == "Bloqueado") or (b.get("service") == "INDISPONIVEL")
         out.append({
             "id": b.get("id", ""),
             "time": b.get("time", ""),
             "dur": b.get("dur", 30),
-            "status": b.get("status", "Marcado"),
+            "status": st,
             "label": "INDISPONÍVEL" if is_block else "OCUPADO",
             "service": b.get("service", ""),
             "notes": b.get("notes", "")
         })
     return out
 
+@app.get("/day")
+def day():
+    date = request.args.get("date", "")
+    barber = request.args.get("barber", "")
+    return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
 @app.get("/busy")
 def busy():
     date = request.args.get("date", "")
     barber = request.args.get("barber", "")
-    return jsonify({"ok": True, "items": _busy_items(date, barber)})
-
-
-@app.get("/day")
-def day():
-    date = request.args.get("date", "")
-    barber = request.args.get("barber", "")
-    return jsonify({"ok": True, "items": _busy_items(date, barber)})
-
+    return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
 # ==========================
-# ADMIN: LISTAR/EDITAR/APAGAR
+# ADMIN: LISTAR (com histórico)
 # ==========================
 @app.get("/admin/bookings")
 def admin_list():
@@ -206,35 +221,24 @@ def admin_list():
     out.sort(key=lambda x: (x.get("date",""), x.get("time","")))
     return jsonify({"ok": True, "items": out})
 
-
-@app.patch("/admin/bookings/<bid>")
-def admin_patch(bid):
+# ==========================
+# ADMIN: CANCELAR marcação (histórico)
+# ==========================
+@app.post("/admin/cancel/<bid>")
+def admin_cancel(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
 
     if bid not in BOOKINGS:
         return bad("not found", 404)
 
-    data = request.get_json(silent=True) or {}
-    BOOKINGS[bid] = {**BOOKINGS[bid], **data}
+    BOOKINGS[bid]["status"] = "Cancelado"
+    save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
-
-@app.delete("/admin/bookings/<bid>")
-def admin_delete(bid):
-    if not is_admin(request):
-        return bad("unauthorized", 401)
-
-    existed = bid in BOOKINGS
-    BOOKINGS.pop(bid, None)
-    if existed:
-        push_change("delete", {"id": bid})
-    return jsonify({"ok": True})
-
-
 # ==========================
-# ✅ ADMIN: BLOQUEAR HORÁRIO
+# ADMIN: BLOQUEAR
 # ==========================
 @app.post("/admin/block")
 def admin_block():
@@ -242,12 +246,9 @@ def admin_block():
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-
     date = str(data.get("date", "")).strip()
     time_ = str(data.get("time", "")).strip()[:5]
-    dur = int(float(data.get("dur", 30) or 30))
     barber = str(data.get("barber", "")).strip()
-    notes = str(data.get("notes", "")).strip()
 
     if not date or not time_ or not barber:
         return bad("Campos obrigatórios: date, time, barber")
@@ -262,8 +263,8 @@ def admin_block():
         "barber": barber,
         "date": date,
         "time": time_,
-        "dur": dur,
-        "notes": notes,
+        "dur": 30,
+        "notes": "",
         "status": "Bloqueado",
         "client_id": "",
         "client": "INDISPONÍVEL",
@@ -271,12 +272,12 @@ def admin_block():
     }
 
     BOOKINGS[bid] = item
+    save_bookings()
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
-
 # ==========================
-# ✅ ADMIN: DESBLOQUEAR (HISTÓRICO)
+# ADMIN: DESBLOQUEAR (histórico)
 # ==========================
 @app.post("/admin/unblock/<bid>")
 def admin_unblock(bid):
@@ -286,17 +287,10 @@ def admin_unblock(bid):
     if bid not in BOOKINGS:
         return bad("not found", 404)
 
-    # Em vez de apagar: mantém no histórico
     BOOKINGS[bid]["status"] = "Desbloqueado"
-
-    # opcional: marcar nota automaticamente
-    n = (BOOKINGS[bid].get("notes") or "").strip()
-    if "desbloqueado" not in n.lower():
-        BOOKINGS[bid]["notes"] = (n + " | desbloqueado").strip(" |")
-
+    save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
