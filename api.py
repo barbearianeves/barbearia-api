@@ -19,6 +19,16 @@
 //   barbearia_data/agenda/YYYY-MM-DD.txt
 //   barbearia_data/faturacao.txt
 
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from collections import deque
+import os, time, secrets, json
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# ... resto igual ao teu código ...
+
 #include <gtk/gtk.h>
 #include <glib.h>
 #include <glib/gstdio.h>
