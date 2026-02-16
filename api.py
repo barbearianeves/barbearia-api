@@ -7,16 +7,22 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "neves-12345")
 
-BOOKINGS = {}               # id -> booking dict (memória)
-CHANGES = deque(maxlen=20000)  # eventos p/ bridge (memória)
+# ✅ NOVO: token para o barbeiro (configura no Render -> Environment)
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")
+
+# Estado central (memória) — no free tier reinicia se dormir (ok p/ já)
+BOOKINGS = {}  # id -> booking dict
+CHANGES = deque(maxlen=20000)  # fila de eventos p/ bridge
+
 
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
 
+
 def bad(msg, code=400):
     return jsonify({"error": msg}), code
+
 
 def push_change(op, payload):
     CHANGES.append({
@@ -25,8 +31,11 @@ def push_change(op, payload):
         "ts": int(time.time())
     })
 
+
+# ✅ NOVO: valida admin
 def is_admin(req):
     return req.headers.get("X-Admin-Token", "") == ADMIN_TOKEN
+
 
 @app.get("/")
 def home():
@@ -36,6 +45,7 @@ def home():
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES)
     })
+
 
 @app.post("/book")
 def book():
@@ -49,8 +59,7 @@ def book():
     if len(t) >= 5:
         t = t[:5]
 
-    bid = data.get("id") or now_id()
-
+    bid = now_id()
     item = {
         "id": bid,
         "name": str(data.get("name", "")).strip(),
@@ -62,10 +71,7 @@ def book():
         "time": t,                                   # HH:MM
         "dur": int(float(data.get("dur", 30))),
         "notes": str(data.get("notes", "")).strip(),
-        "status": str(data.get("status", "Marcado")).strip() or "Marcado",
-        # compat com bridge/C
-        "client_id": str(data.get("client_id", "")).strip(),
-        "client": str(data.get("client", "")).strip(),
+        "status": "Marcado",
         "created_at": int(time.time())
     }
 
@@ -73,7 +79,8 @@ def book():
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
-# Bridge puxa alterações
+
+# Bridge puxa alterações (novos/updates/deletes)
 @app.get("/pull")
 def pull():
     secret = request.args.get("secret", "")
@@ -83,13 +90,15 @@ def pull():
     cursor = int(request.args.get("cursor", "0"))
     limit = int(request.args.get("limit", "200"))
 
+    # cursor é um índice simples na lista de changes
     changes_list = list(CHANGES)
     out = changes_list[cursor: cursor + limit]
     new_cursor = min(cursor + len(out), len(changes_list))
 
     return jsonify({"ok": True, "cursor": new_cursor, "items": out})
 
-# Bridge envia alterações do PC
+
+# Bridge envia alterações vindas do PC (apagar/cancelar/editar)
 @app.post("/sync")
 def sync():
     secret = request.args.get("secret", "")
@@ -108,11 +117,9 @@ def sync():
 
         if op == "delete":
             bid = payload.get("id")
-            if bid:
-                existed = bid in BOOKINGS
+            if bid and bid in BOOKINGS:
                 BOOKINGS.pop(bid, None)
-                if existed:
-                    push_change("delete", {"id": bid})
+                push_change("delete", {"id": bid})
                 applied += 1
 
         elif op == "upsert":
@@ -125,6 +132,7 @@ def sync():
 
     return jsonify({"ok": True, "applied": applied})
 
+
 def _busy_items(date: str = "", barber: str = ""):
     out = []
     for b in BOOKINGS.values():
@@ -135,27 +143,33 @@ def _busy_items(date: str = "", barber: str = ""):
         if b.get("status") == "Cancelado":
             continue
         out.append({
-            "id": b.get("id", ""),
-            "time": b.get("time", ""),
+            "id": b["id"],
+            "time": b["time"],
             "dur": b.get("dur", 30),
-            "status": b.get("status", "Marcado"),
+            "status": b.get("status", "Marcado")
         })
-    out.sort(key=lambda x: x.get("time", ""))
     return out
 
+
+# (para a página saber o que está ocupado)
 @app.get("/busy")
 def busy():
     date = request.args.get("date", "")
     barber = request.args.get("barber", "")
     return jsonify({"ok": True, "items": _busy_items(date, barber)})
 
+
+# Alias para compatibilidade com o frontend que chama /day (evita 404)
 @app.get("/day")
 def day():
     date = request.args.get("date", "")
     barber = request.args.get("barber", "")
     return jsonify({"ok": True, "items": _busy_items(date, barber)})
 
-# -------- ADMIN (Barbeiro) --------
+
+# ==========================
+# ✅ NOVO: ENDPOINTS ADMIN
+# ==========================
 
 @app.get("/admin/bookings")
 def admin_list():
@@ -173,8 +187,9 @@ def admin_list():
             continue
         out.append(b)
 
-    out.sort(key=lambda x: (x.get("date",""), x.get("time","")))
+    out.sort(key=lambda x: x.get("time", ""))
     return jsonify({"ok": True, "items": out})
+
 
 @app.patch("/admin/bookings/<bid>")
 def admin_patch(bid):
@@ -186,8 +201,11 @@ def admin_patch(bid):
 
     data = request.get_json(silent=True) or {}
     BOOKINGS[bid] = {**BOOKINGS[bid], **data}
+
+    # importante: enviar mudança para a bridge
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
+
 
 @app.delete("/admin/bookings/<bid>")
 def admin_delete(bid):
@@ -195,10 +213,13 @@ def admin_delete(bid):
         return bad("unauthorized", 401)
 
     existed = bid in BOOKINGS
-    BOOKINGS.pop(bid, None)
     if existed:
+        BOOKINGS.pop(bid, None)
         push_change("delete", {"id": bid})
+
     return jsonify({"ok": True})
 
+
 if __name__ == "__main__":
+    # Ajusta host/port se precisares
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
