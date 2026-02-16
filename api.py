@@ -7,7 +7,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
-ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")
+ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "neves-12345")
 
 # ✅ Persistência (Render Disk) — NÃO é base de dados
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
