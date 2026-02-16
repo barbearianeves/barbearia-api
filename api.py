@@ -7,13 +7,11 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
+ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")
 
-# ✅ NOVO: token para o barbeiro (configura no Render -> Environment)
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")
-
-# Estado central (memória) — no free tier reinicia se dormir (ok p/ já)
-BOOKINGS = {}  # id -> booking dict
-CHANGES = deque(maxlen=20000)  # fila de eventos p/ bridge
+# Estado central (memória)
+BOOKINGS = {}                 # id -> booking dict
+CHANGES  = deque(maxlen=20000)  # eventos para bridge
 
 
 def now_id():
@@ -32,7 +30,6 @@ def push_change(op, payload):
     })
 
 
-# ✅ NOVO: valida admin
 def is_admin(req):
     return req.headers.get("X-Admin-Token", "") == ADMIN_TOKEN
 
@@ -47,6 +44,9 @@ def home():
     })
 
 
+# -------------------------
+# CLIENTE: CRIAR MARCAÇÃO
+# -------------------------
 @app.post("/book")
 def book():
     data = request.get_json(silent=True) or {}
@@ -59,7 +59,8 @@ def book():
     if len(t) >= 5:
         t = t[:5]
 
-    bid = now_id()
+    bid = data.get("id") or now_id()
+
     item = {
         "id": bid,
         "name": str(data.get("name", "")).strip(),
@@ -71,7 +72,12 @@ def book():
         "time": t,                                   # HH:MM
         "dur": int(float(data.get("dur", 30))),
         "notes": str(data.get("notes", "")).strip(),
-        "status": "Marcado",
+        "status": str(data.get("status", "Marcado")).strip() or "Marcado",
+
+        # compat com bridge/C (se vier)
+        "client_id": str(data.get("client_id", "")).strip(),
+        "client": str(data.get("client", "")).strip(),
+
         "created_at": int(time.time())
     }
 
@@ -80,7 +86,9 @@ def book():
     return jsonify({"ok": True, "id": bid})
 
 
-# Bridge puxa alterações (novos/updates/deletes)
+# -------------------------
+# BRIDGE: PULL / SYNC
+# -------------------------
 @app.get("/pull")
 def pull():
     secret = request.args.get("secret", "")
@@ -88,9 +96,8 @@ def pull():
         return bad("unauthorized", 401)
 
     cursor = int(request.args.get("cursor", "0"))
-    limit = int(request.args.get("limit", "200"))
+    limit  = int(request.args.get("limit", "200"))
 
-    # cursor é um índice simples na lista de changes
     changes_list = list(CHANGES)
     out = changes_list[cursor: cursor + limit]
     new_cursor = min(cursor + len(out), len(changes_list))
@@ -98,7 +105,6 @@ def pull():
     return jsonify({"ok": True, "cursor": new_cursor, "items": out})
 
 
-# Bridge envia alterações vindas do PC (apagar/cancelar/editar)
 @app.post("/sync")
 def sync():
     secret = request.args.get("secret", "")
@@ -117,9 +123,11 @@ def sync():
 
         if op == "delete":
             bid = payload.get("id")
-            if bid and bid in BOOKINGS:
+            if bid:
+                existed = bid in BOOKINGS
                 BOOKINGS.pop(bid, None)
-                push_change("delete", {"id": bid})
+                if existed:
+                    push_change("delete", {"id": bid})
                 applied += 1
 
         elif op == "upsert":
@@ -133,6 +141,9 @@ def sync():
     return jsonify({"ok": True, "applied": applied})
 
 
+# -------------------------
+# CLIENTE: VER OCUPADOS/DIA
+# -------------------------
 def _busy_items(date: str = "", barber: str = ""):
     out = []
     for b in BOOKINGS.values():
@@ -142,16 +153,22 @@ def _busy_items(date: str = "", barber: str = ""):
             continue
         if b.get("status") == "Cancelado":
             continue
+
+        is_block = (b.get("status") == "Bloqueado") or (b.get("service") == "INDISPONIVEL")
+
         out.append({
-            "id": b["id"],
-            "time": b["time"],
+            "id": b.get("id", ""),
+            "time": b.get("time", ""),
             "dur": b.get("dur", 30),
-            "status": b.get("status", "Marcado")
+            "status": b.get("status", "Marcado"),
+            # 👇 para o index mostrar a razão
+            "label": "INDISPONÍVEL" if is_block else "OCUPADO",
+            "service": b.get("service", ""),
+            "notes": b.get("notes", "")
         })
     return out
 
 
-# (para a página saber o que está ocupado)
 @app.get("/busy")
 def busy():
     date = request.args.get("date", "")
@@ -159,7 +176,6 @@ def busy():
     return jsonify({"ok": True, "items": _busy_items(date, barber)})
 
 
-# Alias para compatibilidade com o frontend que chama /day (evita 404)
 @app.get("/day")
 def day():
     date = request.args.get("date", "")
@@ -168,9 +184,8 @@ def day():
 
 
 # ==========================
-# ✅ NOVO: ENDPOINTS ADMIN
+# ADMIN: LISTAR/EDITAR/APAGAR
 # ==========================
-
 @app.get("/admin/bookings")
 def admin_list():
     if not is_admin(request):
@@ -187,7 +202,7 @@ def admin_list():
             continue
         out.append(b)
 
-    out.sort(key=lambda x: x.get("time", ""))
+    out.sort(key=lambda x: (x.get("date",""), x.get("time","")))
     return jsonify({"ok": True, "items": out})
 
 
@@ -201,8 +216,6 @@ def admin_patch(bid):
 
     data = request.get_json(silent=True) or {}
     BOOKINGS[bid] = {**BOOKINGS[bid], **data}
-
-    # importante: enviar mudança para a bridge
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
@@ -213,13 +226,53 @@ def admin_delete(bid):
         return bad("unauthorized", 401)
 
     existed = bid in BOOKINGS
+    BOOKINGS.pop(bid, None)
     if existed:
-        BOOKINGS.pop(bid, None)
         push_change("delete", {"id": bid})
-
     return jsonify({"ok": True})
 
 
+# ==========================
+# ✅ ADMIN: BLOQUEAR HORÁRIO
+# ==========================
+@app.post("/admin/block")
+def admin_block():
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+
+    date = str(data.get("date", "")).strip()
+    time_ = str(data.get("time", "")).strip()[:5]
+    dur = int(float(data.get("dur", 30) or 30))
+    barber = str(data.get("barber", "")).strip()
+    notes = str(data.get("notes", "")).strip()
+
+    if not date or not time_ or not barber:
+        return bad("Campos obrigatórios: date, time, barber")
+
+    bid = now_id()
+    item = {
+        "id": bid,
+        "name": "INDISPONÍVEL",
+        "phone": "",
+        "email": "",
+        "service": "INDISPONIVEL",
+        "barber": barber,
+        "date": date,
+        "time": time_,
+        "dur": dur,
+        "notes": notes,
+        "status": "Bloqueado",
+        "client_id": "",
+        "client": "INDISPONÍVEL",
+        "created_at": int(time.time())
+    }
+
+    BOOKINGS[bid] = item
+    push_change("upsert", item)
+    return jsonify({"ok": True, "id": bid})
+
+
 if __name__ == "__main__":
-    # Ajusta host/port se precisares
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
