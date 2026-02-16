@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import deque
@@ -43,7 +42,7 @@ def load_bookings():
             BOOKINGS = data if isinstance(data, dict) else {}
         else:
             BOOKINGS = {}
-    except:
+    except Exception:
         BOOKINGS = {}
 
 def save_bookings():
@@ -142,7 +141,7 @@ def sync():
             continue
 
         if op == "delete":
-            # ⚠️ não usamos delete real no histórico (mas deixa compat se quiseres)
+            # opcional: delete real (mantém compat)
             existed = bid in BOOKINGS
             BOOKINGS.pop(bid, None)
             if existed:
@@ -160,9 +159,7 @@ def sync():
 
 # -------------------------
 # CLIENTE: VER OCUPADOS/DIA
-# - só bloqueia se estiver mesmo ocupado/bloqueado
-# - ignora Cancelado e Desbloqueado (histórico)
-# - NÃO envia nomes/telefones (privacidade)
+# (privacidade: não manda nome/telefone)
 # -------------------------
 def _day_items_for_clients(date: str = "", barber: str = ""):
     out = []
@@ -294,4 +291,5 @@ def admin_unblock(bid):
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
+    # ✅ CORRIGIDO: sem vírgula, sem texto extra
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
