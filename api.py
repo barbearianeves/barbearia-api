@@ -7,7 +7,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
-ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "neves-12345")
+ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")  # <-- separa do secret
 
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
@@ -28,22 +28,17 @@ def is_admin(req):
 # ✅ STORAGE: escolher diretório escrevível
 # -------------------------
 def pick_data_dir():
-    # 1) se o Render Disk estiver montado, vais pôr DATA_DIR nas env vars (ex: /var/data no DISK mount)
     cand = os.environ.get("DATA_DIR", "").strip()
     candidates = []
     if cand:
         candidates.append(cand)
 
-    # 2) fallback: pasta local do projeto
     candidates.append(os.path.join(os.path.dirname(__file__), "data"))
-
-    # 3) fallback: /tmp (normalmente escrevível)
     candidates.append("/tmp/barbearia_data")
 
     for p in candidates:
         try:
             os.makedirs(p, exist_ok=True)
-            # teste de escrita
             testf = os.path.join(p, ".write_test")
             with open(testf, "w", encoding="utf-8") as f:
                 f.write("ok")
@@ -52,7 +47,6 @@ def pick_data_dir():
         except Exception:
             continue
 
-    # último recurso: sem persistência
     return None
 
 DATA_DIR = pick_data_dir()
@@ -84,8 +78,8 @@ def save_bookings():
 
 load_bookings()
 
-# Opcional: ao arrancar, mete "snapshot" de tudo em CHANGES
-# (assim a bridge consegue puxar tudo mesmo se reiniciar)
+# ✅ snapshot em memória (para bridge puxar após restart)
+CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
 
@@ -98,6 +92,10 @@ def home():
         "changes": len(CHANGES),
         "persist": BOOKINGS_FILE or "NO_PERSIST"
     })
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
 
 # -------------------------
 # CLIENTE: CRIAR MARCAÇÃO
@@ -125,11 +123,8 @@ def book():
         "dur": int(float(data.get("dur", 30))),
         "notes": str(data.get("notes", "")).strip(),
         "status": "Marcado",
-
-        # compat bridge/C
         "client_id": str(data.get("client_id", "")).strip(),
         "client": str(data.get("client", "")).strip(),
-
         "created_at": int(time.time())
     }
 
@@ -189,6 +184,37 @@ def sync():
             applied += 1
 
     return jsonify({"ok": True, "applied": applied})
+
+# -------------------------
+# ✅ BRIDGE: REPOR ESTADO COMPLETO (TXT é a verdade)
+# -------------------------
+@app.post("/replace_all")
+def replace_all():
+    secret = request.args.get("secret", "")
+    if secret != BRIDGE_SECRET:
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return bad("items inválido")
+
+    global BOOKINGS
+    BOOKINGS = {}
+
+    for b in items:
+        bid = str(b.get("id", "")).strip()
+        if not bid:
+            continue
+        BOOKINGS[bid] = b
+
+    save_bookings()
+
+    CHANGES.clear()
+    for b in BOOKINGS.values():
+        push_change("upsert", b)
+
+    return jsonify({"ok": True, "count": len(BOOKINGS)})
 
 # -------------------------
 # CLIENTE: VER OCUPADOS/DIA
