@@ -3,14 +3,24 @@ from flask_cors import CORS
 from collections import deque
 import os, time, secrets, json
 
+# ✅ email
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
-ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")  # <-- separa do secret
+ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")  # token do admin (barbeiro)
+
+# ✅ Email (Gmail SMTP)
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "barbeariateste0@gmail.com")
+SMTP_PASS  = os.environ.get("SMTP_PASS", "")  # definir no Render (App Password)
 
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
+
 
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
@@ -23,6 +33,7 @@ def push_change(op, payload):
 
 def is_admin(req):
     return req.headers.get("X-Admin-Token", "") == ADMIN_TOKEN
+
 
 # -------------------------
 # ✅ STORAGE: escolher diretório escrevível
@@ -83,6 +94,61 @@ CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
 
+
+# -------------------------
+# ✅ EMAIL: enviar confirmação ao cliente
+# -------------------------
+def send_validation_email(booking, subject=None, body=None):
+    """
+    Envia email ao booking["email"].
+    Requer SMTP_PASS (App Password do Gmail) no ambiente.
+    """
+    to_email = (booking.get("email") or "").strip()
+    if not to_email:
+        return False, "Cliente sem email"
+
+    if not SMTP_PASS:
+        return False, "SMTP_PASS não definido no servidor"
+
+    try:
+        subj = subject or "Confirmação da sua marcação - Barbearia"
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = subj
+
+        if body is None:
+            body = f"""Olá {booking.get("name","")},
+
+A sua marcação foi validada com sucesso!
+
+Data: {booking.get("date")}
+Hora: {booking.get("time")}
+Serviço: {booking.get("service")}
+Barbeiro: {booking.get("barber")}
+
+Obrigado pela preferência!
+Barbearia Neves
+"""
+
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(SMTP_EMAIL, SMTP_PASS)
+        server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        server.quit()
+
+        return True, "Email enviado"
+    except Exception as e:
+        return False, str(e)
+
+
+# -------------------------
+# HOME / HEALTH
+# -------------------------
 @app.get("/")
 def home():
     return jsonify({
@@ -96,6 +162,7 @@ def home():
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
+
 
 # -------------------------
 # CLIENTE: CRIAR MARCAÇÃO
@@ -132,6 +199,7 @@ def book():
     save_bookings()
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
+
 
 # -------------------------
 # BRIDGE: PULL / SYNC
@@ -185,6 +253,7 @@ def sync():
 
     return jsonify({"ok": True, "applied": applied})
 
+
 # -------------------------
 # ✅ BRIDGE: REPOR ESTADO COMPLETO (TXT é a verdade)
 # -------------------------
@@ -215,6 +284,7 @@ def replace_all():
         push_change("upsert", b)
 
     return jsonify({"ok": True, "count": len(BOOKINGS)})
+
 
 # -------------------------
 # CLIENTE: VER OCUPADOS/DIA
@@ -255,6 +325,7 @@ def busy():
     barber = request.args.get("barber", "")
     return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
+
 # ==========================
 # ADMIN: LISTAR
 # ==========================
@@ -277,6 +348,7 @@ def admin_list():
     out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
     return jsonify({"ok": True, "items": out})
 
+
 # ==========================
 # ADMIN: CANCELAR
 # ==========================
@@ -292,6 +364,7 @@ def admin_cancel(bid):
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
+
 
 # ==========================
 # ADMIN: BLOQUEAR
@@ -332,6 +405,7 @@ def admin_block():
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
+
 # ==========================
 # ADMIN: DESBLOQUEAR
 # ==========================
@@ -347,6 +421,38 @@ def admin_unblock(bid):
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
+
+
+# ==========================
+# ✅ ADMIN: VALIDAR + EMAIL
+# ==========================
+@app.post("/admin/validate_and_email/<bid>")
+def admin_validate_and_email(bid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    if bid not in BOOKINGS:
+        return bad("not found", 404)
+
+    data = request.get_json(silent=True) or {}
+
+    # estado que queres meter quando valida
+    # (podes mudar para "Chegou" / "EmAtendimento" / "Concluido")
+    new_status = (data.get("status") or "Chegou").strip()
+
+    BOOKINGS[bid]["status"] = new_status
+    save_bookings()
+    push_change("upsert", BOOKINGS[bid])
+
+    ok, msg_email = send_validation_email(BOOKINGS[bid])
+
+    return jsonify({
+        "ok": True,
+        "status": new_status,
+        "email_sent": ok,
+        "message": msg_email
+    })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
