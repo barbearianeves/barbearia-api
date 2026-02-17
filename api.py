@@ -4,23 +4,28 @@ from collections import deque
 import os, time, secrets, json
 
 # ✅ email
-import smtplib
+import smtplib, ssl, socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345")
-ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026")  # token do admin (barbeiro)
+# =========================
+# CONFIG / SECRETS
+# =========================
+BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345").strip()
+ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026").strip()
 
-# ✅ Email (Gmail SMTP)
-SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "barbeariateste0@gmail.com")
-SMTP_PASS  = os.environ.get("SMTP_PASS", "")  # definir no Render (App Password)
+# ✅ Email (Render envs como no teu print)
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "").strip() or os.environ.get("SMTP_USER", "").strip()
+SMTP_HOST  = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
+SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER  = os.environ.get("SMTP_USER", "").strip() or FROM_EMAIL
+SMTP_PASS  = os.environ.get("SMTP_PASS", "").strip()
 
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
-
 
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
@@ -32,7 +37,7 @@ def push_change(op, payload):
     CHANGES.append({"op": op, "payload": payload, "ts": int(time.time())})
 
 def is_admin(req):
-    return req.headers.get("X-Admin-Token", "") == ADMIN_TOKEN
+    return (req.headers.get("X-Admin-Token", "") or "").strip() == ADMIN_TOKEN
 
 
 # -------------------------
@@ -57,7 +62,6 @@ def pick_data_dir():
             return p
         except Exception:
             continue
-
     return None
 
 DATA_DIR = pick_data_dir()
@@ -68,7 +72,6 @@ def load_bookings():
     if not BOOKINGS_FILE:
         BOOKINGS = {}
         return
-
     try:
         if os.path.exists(BOOKINGS_FILE):
             with open(BOOKINGS_FILE, "r", encoding="utf-8") as f:
@@ -96,16 +99,37 @@ for b in BOOKINGS.values():
 
 
 # -------------------------
-# ✅ EMAIL: enviar confirmação ao cliente
+# ✅ EMAIL: enviar confirmação ao cliente (FORÇA IPv4)
 # -------------------------
+def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
+    """
+    Resolve host para IPv4 e liga por IPv4.
+    Evita Errno 101 em hosts sem rota IPv6.
+    """
+    # tenta resolver para IPv4
+    ipv4 = None
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        if infos:
+            ipv4 = infos[0][4][0]
+    except Exception:
+        ipv4 = None
+
+    target_host = ipv4 or host
+    return smtplib.SMTP(target_host, port, timeout=timeout)
+
 def send_validation_email(booking, subject=None, body=None):
     """
     Envia email ao booking["email"].
-    Requer SMTP_PASS (App Password do Gmail) no ambiente.
+    Requer SMTP_PASS no ambiente.
+    Para Gmail, usa App Password (não é a password normal).
     """
     to_email = (booking.get("email") or "").strip()
     if not to_email:
         return False, "Cliente sem email"
+
+    if not SMTP_USER or not FROM_EMAIL:
+        return False, "SMTP_USER/FROM_EMAIL não definidos no servidor"
 
     if not SMTP_PASS:
         return False, "SMTP_PASS não definido no servidor"
@@ -113,7 +137,7 @@ def send_validation_email(booking, subject=None, body=None):
     try:
         subj = subject or "Confirmação da sua marcação - Barbearia"
         msg = MIMEMultipart()
-        msg["From"] = SMTP_EMAIL
+        msg["From"] = FROM_EMAIL
         msg["To"] = to_email
         msg["Subject"] = subj
 
@@ -128,22 +152,22 @@ Serviço: {booking.get("service")}
 Barbeiro: {booking.get("barber")}
 
 Obrigado pela preferência!
-Barbearia Neves
+Barbearia
 """
 
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=20)
+        server = smtp_connect_ipv4(SMTP_HOST, SMTP_PORT, timeout=20)
         server.ehlo()
-        server.starttls()
+        server.starttls(context=ssl.create_default_context())
         server.ehlo()
-        server.login(SMTP_EMAIL, SMTP_PASS)
-        server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
         server.quit()
 
         return True, "Email enviado"
     except Exception as e:
-        return False, str(e)
+        return False, f"{type(e).__name__}: {e}"
 
 
 # -------------------------
@@ -253,10 +277,6 @@ def sync():
 
     return jsonify({"ok": True, "applied": applied})
 
-
-# -------------------------
-# ✅ BRIDGE: REPOR ESTADO COMPLETO (TXT é a verdade)
-# -------------------------
 @app.post("/replace_all")
 def replace_all():
     secret = request.args.get("secret", "")
@@ -435,9 +455,6 @@ def admin_validate_and_email(bid):
         return bad("not found", 404)
 
     data = request.get_json(silent=True) or {}
-
-    # estado que queres meter quando valida
-    # (podes mudar para "Chegou" / "EmAtendimento" / "Concluido")
     new_status = (data.get("status") or "Chegou").strip()
 
     BOOKINGS[bid]["status"] = new_status
@@ -454,5 +471,8 @@ def admin_validate_and_email(bid):
     })
 
 
+# ==========================
+# RUN
+# ==========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
