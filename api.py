@@ -17,12 +17,12 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345").strip()
 ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026").strip()
 
-# ✅ Email (Render envs como no teu print)
-FROM_EMAIL = os.environ.get("FROM_EMAIL", "").strip() or os.environ.get("SMTP_USER", "").strip()
-SMTP_HOST  = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
-SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER  = os.environ.get("SMTP_USER", "").strip() or FROM_EMAIL
-SMTP_PASS  = os.environ.get("SMTP_PASS", "").strip()
+# ✅ Email (Render envs)
+FROM_EMAIL = (os.environ.get("FROM_EMAIL", "") or "").strip() or (os.environ.get("SMTP_USER", "") or "").strip()
+SMTP_HOST  = (os.environ.get("SMTP_HOST", "smtp.gmail.com") or "").strip()
+SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587") or "587")
+SMTP_USER  = (os.environ.get("SMTP_USER", "") or "").strip() or FROM_EMAIL
+SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
@@ -39,12 +39,11 @@ def push_change(op, payload):
 def is_admin(req):
     return (req.headers.get("X-Admin-Token", "") or "").strip() == ADMIN_TOKEN
 
-
 # -------------------------
 # ✅ STORAGE: escolher diretório escrevível
 # -------------------------
 def pick_data_dir():
-    cand = os.environ.get("DATA_DIR", "").strip()
+    cand = (os.environ.get("DATA_DIR", "") or "").strip()
     candidates = []
     if cand:
         candidates.append(cand)
@@ -97,16 +96,14 @@ CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
 
-
 # -------------------------
-# ✅ EMAIL: enviar confirmação ao cliente (FORÇA IPv4)
+# ✅ EMAIL: SMTP por IPv4 + logs
 # -------------------------
 def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
     """
     Resolve host para IPv4 e liga por IPv4.
-    Evita Errno 101 em hosts sem rota IPv6.
+    Ajuda em ambientes sem rota IPv6.
     """
-    # tenta resolver para IPv4
     ipv4 = None
     try:
         infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
@@ -115,31 +112,22 @@ def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
     except Exception:
         ipv4 = None
 
-    target_host = ipv4 or host
-    return smtplib.SMTP(target_host, port, timeout=timeout)
+    target = ipv4 or host
+    return smtplib.SMTP(target, port, timeout=timeout)
 
 def send_validation_email(booking, subject=None, body=None):
-    """
-    Envia email ao booking["email"].
-    Requer SMTP_PASS no ambiente.
-    Para Gmail, usa App Password (não é a password normal).
-    """
     to_email = (booking.get("email") or "").strip()
     if not to_email:
         return False, "Cliente sem email"
 
     if not SMTP_USER or not FROM_EMAIL:
-        return False, "SMTP_USER/FROM_EMAIL não definidos no servidor"
+        return False, "SMTP_USER/FROM_EMAIL não definidos"
 
     if not SMTP_PASS:
-        return False, "SMTP_PASS não definido no servidor"
+        return False, "SMTP_PASS não definido"
 
     try:
         subj = subject or "Confirmação da sua marcação - Barbearia"
-        msg = MIMEMultipart()
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
-        msg["Subject"] = subj
 
         if body is None:
             body = f"""Olá {booking.get("name","")},
@@ -155,20 +143,32 @@ Obrigado pela preferência!
 Barbearia
 """
 
+        msg = MIMEMultipart()
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = subj
         msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        # ✅ Logs úteis no Render
+        print(f"[EMAIL] to={to_email} host={SMTP_HOST} port={SMTP_PORT} user={SMTP_USER}", flush=True)
 
         server = smtp_connect_ipv4(SMTP_HOST, SMTP_PORT, timeout=20)
         server.ehlo()
         server.starttls(context=ssl.create_default_context())
         server.ehlo()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-        server.quit()
+        print("[EMAIL] starttls OK", flush=True)
 
+        server.login(SMTP_USER, SMTP_PASS)
+        print("[EMAIL] login OK", flush=True)
+
+        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+        print("[EMAIL] sendmail OK", flush=True)
+
+        server.quit()
         return True, "Email enviado"
     except Exception as e:
+        print(f"[EMAIL] ERRO: {type(e).__name__}: {e}", flush=True)
         return False, f"{type(e).__name__}: {e}"
-
 
 # -------------------------
 # HOME / HEALTH
@@ -180,13 +180,44 @@ def home():
         "service": "barbearia-api",
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES),
-        "persist": BOOKINGS_FILE or "NO_PERSIST"
+        "persist": BOOKINGS_FILE or "NO_PERSIST",
+        "smtp": {
+            "from": FROM_EMAIL,
+            "host": SMTP_HOST,
+            "port": SMTP_PORT,
+            "user_set": bool(SMTP_USER),
+            "pass_set": bool(SMTP_PASS)
+        }
     })
 
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
+# -------------------------
+# ✅ ADMIN: TESTE EMAIL (NÃO depende de booking)
+# -------------------------
+@app.post("/admin/test_email")
+def admin_test_email():
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    to_email = (data.get("to") or "").strip()
+    if not to_email:
+        return bad("Campo obrigatório: to")
+
+    fake_booking = {
+        "email": to_email,
+        "name": "Teste",
+        "date": time.strftime("%Y-%m-%d"),
+        "time": time.strftime("%H:%M"),
+        "service": "Teste SMTP",
+        "barber": "Sistema",
+    }
+
+    ok, msg = send_validation_email(fake_booking, subject="✅ Teste SMTP - Barbearia")
+    return jsonify({"ok": ok, "message": msg})
 
 # -------------------------
 # CLIENTE: CRIAR MARCAÇÃO
@@ -223,7 +254,6 @@ def book():
     save_bookings()
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
-
 
 # -------------------------
 # BRIDGE: PULL / SYNC
@@ -305,7 +335,6 @@ def replace_all():
 
     return jsonify({"ok": True, "count": len(BOOKINGS)})
 
-
 # -------------------------
 # CLIENTE: VER OCUPADOS/DIA
 # -------------------------
@@ -345,7 +374,6 @@ def busy():
     barber = request.args.get("barber", "")
     return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
-
 # ==========================
 # ADMIN: LISTAR
 # ==========================
@@ -368,7 +396,6 @@ def admin_list():
     out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
     return jsonify({"ok": True, "items": out})
 
-
 # ==========================
 # ADMIN: CANCELAR
 # ==========================
@@ -384,7 +411,6 @@ def admin_cancel(bid):
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
-
 
 # ==========================
 # ADMIN: BLOQUEAR
@@ -425,7 +451,6 @@ def admin_block():
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
-
 # ==========================
 # ADMIN: DESBLOQUEAR
 # ==========================
@@ -442,7 +467,6 @@ def admin_unblock(bid):
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
-
 # ==========================
 # ✅ ADMIN: VALIDAR + EMAIL
 # ==========================
@@ -457,6 +481,11 @@ def admin_validate_and_email(bid):
     data = request.get_json(silent=True) or {}
     new_status = (data.get("status") or "Chegou").strip()
 
+    # (Opcional) permitir definir email aqui:
+    incoming_email = (data.get("email") or "").strip()
+    if incoming_email:
+        BOOKINGS[bid]["email"] = incoming_email
+
     BOOKINGS[bid]["status"] = new_status
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
@@ -470,9 +499,5 @@ def admin_validate_and_email(bid):
         "message": msg_email
     })
 
-
-# ==========================
-# RUN
-# ==========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
