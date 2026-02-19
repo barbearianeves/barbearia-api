@@ -39,6 +39,9 @@ def push_change(op, payload):
 def is_admin(req):
     return (req.headers.get("X-Admin-Token", "") or "").strip() == ADMIN_TOKEN
 
+def norm_str(x):
+    return (x or "").strip()
+
 # -------------------------
 # ✅ STORAGE: escolher diretório escrevível
 # -------------------------
@@ -100,10 +103,6 @@ for b in BOOKINGS.values():
 # ✅ EMAIL: SMTP por IPv4 + logs
 # -------------------------
 def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
-    """
-    Resolve host para IPv4 e liga por IPv4.
-    Ajuda em ambientes sem rota IPv6.
-    """
     ipv4 = None
     try:
         infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
@@ -116,7 +115,7 @@ def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
     return smtplib.SMTP(target, port, timeout=timeout)
 
 def send_validation_email(booking, subject=None, body=None):
-    to_email = (booking.get("email") or "").strip()
+    to_email = norm_str(booking.get("email"))
     if not to_email:
         return False, "Cliente sem email"
 
@@ -149,7 +148,6 @@ Barbearia
         msg["Subject"] = subj
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        # ✅ Logs úteis no Render
         print(f"[EMAIL] to={to_email} host={SMTP_HOST} port={SMTP_PORT} user={SMTP_USER}", flush=True)
 
         server = smtp_connect_ipv4(SMTP_HOST, SMTP_PORT, timeout=20)
@@ -195,7 +193,7 @@ def health():
     return jsonify({"ok": True})
 
 # -------------------------
-# ✅ ADMIN: TESTE EMAIL (NÃO depende de booking)
+# ✅ ADMIN: TESTE EMAIL
 # -------------------------
 @app.post("/admin/test_email")
 def admin_test_email():
@@ -203,7 +201,7 @@ def admin_test_email():
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-    to_email = (data.get("to") or "").strip()
+    to_email = norm_str(data.get("to"))
     if not to_email:
         return bad("Campo obrigatório: to")
 
@@ -227,26 +225,26 @@ def book():
     data = request.get_json(silent=True) or {}
     required = ["name", "phone", "service", "barber", "date", "time", "dur"]
     for k in required:
-        if not str(data.get(k, "")).strip():
+        if not norm_str(str(data.get(k, ""))):
             return bad(f"Campo obrigatório em falta: {k}")
 
-    t = str(data["time"]).strip()[:5]
-    bid = data.get("id") or now_id()
+    t = norm_str(str(data["time"]))[:5]
+    bid = norm_str(data.get("id")) or now_id()
 
     item = {
         "id": bid,
-        "name": str(data.get("name", "")).strip(),
-        "phone": str(data.get("phone", "")).strip(),
-        "email": str(data.get("email", "")).strip(),
-        "service": str(data.get("service", "")).strip(),
-        "barber": str(data.get("barber", "")).strip(),
-        "date": str(data.get("date", "")).strip(),
+        "name": norm_str(data.get("name")),
+        "phone": norm_str(data.get("phone")),
+        "email": norm_str(data.get("email")),
+        "service": norm_str(data.get("service")),
+        "barber": norm_str(data.get("barber")),
+        "date": norm_str(data.get("date")),
         "time": t,
         "dur": int(float(data.get("dur", 30))),
-        "notes": str(data.get("notes", "")).strip(),
+        "notes": norm_str(data.get("notes")),
         "status": "Marcado",
-        "client_id": str(data.get("client_id", "")).strip(),
-        "client": str(data.get("client", "")).strip(),
+        "client_id": norm_str(data.get("client_id")),
+        "client": norm_str(data.get("client")),
         "created_at": int(time.time())
     }
 
@@ -271,6 +269,31 @@ def pull():
     out = changes_list[cursor: cursor + limit]
     new_cursor = min(cursor + len(out), len(changes_list))
     return jsonify({"ok": True, "cursor": new_cursor, "items": out})
+
+def merge_preserving_contact(old: dict, incoming: dict) -> dict:
+    """
+    ✅ NÃO deixa apagar phone/email se vierem vazios no incoming.
+    (mas permite atualizar se vierem preenchidos)
+    """
+    merged = {**(old or {}), **(incoming or {})}
+
+    for key in ["phone", "email"]:
+        inc = norm_str((incoming or {}).get(key))
+        if inc:
+            merged[key] = inc
+        else:
+            # se incoming não tem valor útil, preserva o antigo
+            merged[key] = norm_str((old or {}).get(key))
+
+    # normaliza sempre
+    merged["name"] = norm_str(merged.get("name"))
+    merged["service"] = norm_str(merged.get("service"))
+    merged["barber"] = norm_str(merged.get("barber"))
+    merged["date"] = norm_str(merged.get("date"))
+    merged["time"] = norm_str(merged.get("time"))[:5]
+    merged["status"] = norm_str(merged.get("status")) or "Marcado"
+
+    return merged
 
 @app.post("/sync")
 def sync():
@@ -300,7 +323,8 @@ def sync():
             applied += 1
 
         elif op == "upsert":
-            BOOKINGS[bid] = {**BOOKINGS.get(bid, {}), **payload}
+            old = BOOKINGS.get(bid, {})
+            BOOKINGS[bid] = merge_preserving_contact(old, payload)
             save_bookings()
             push_change("upsert", BOOKINGS[bid])
             applied += 1
@@ -319,13 +343,15 @@ def replace_all():
         return bad("items inválido")
 
     global BOOKINGS
+    old_all = BOOKINGS
     BOOKINGS = {}
 
     for b in items:
-        bid = str(b.get("id", "")).strip()
+        bid = norm_str(b.get("id"))
         if not bid:
             continue
-        BOOKINGS[bid] = b
+        # também preserva contacto na reposição total
+        BOOKINGS[bid] = merge_preserving_contact(old_all.get(bid, {}), b)
 
     save_bookings()
 
@@ -336,7 +362,7 @@ def replace_all():
     return jsonify({"ok": True, "count": len(BOOKINGS)})
 
 # -------------------------
-# CLIENTE: VER OCUPADOS/DIA
+# CLIENTE: VER OCUPADOS/DIA (SEM dados pessoais)
 # -------------------------
 def _day_items_for_clients(date: str = "", barber: str = ""):
     out = []
@@ -382,8 +408,8 @@ def admin_list():
     if not is_admin(request):
         return bad("unauthorized", 401)
 
-    date = (request.args.get("date") or "").strip()
-    barber = (request.args.get("barber") or "").strip()
+    date = norm_str(request.args.get("date"))
+    barber = norm_str(request.args.get("barber"))
 
     out = []
     for b in BOOKINGS.values():
@@ -395,6 +421,40 @@ def admin_list():
 
     out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
     return jsonify({"ok": True, "items": out})
+
+# ✅ ADMIN: OBTER 1 BOOKING COMPLETO (corrige “não tem email/telemóvel”)
+@app.get("/admin/booking/<bid>")
+def admin_get_booking(bid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    b = BOOKINGS.get(bid)
+    if not b:
+        return bad("not found", 404)
+
+    return jsonify({"ok": True, "item": b})
+
+# ✅ ADMIN: atualizar contacto (se precisares corrigir manualmente)
+@app.post("/admin/update_contact/<bid>")
+def admin_update_contact(bid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    if bid not in BOOKINGS:
+        return bad("not found", 404)
+
+    data = request.get_json(silent=True) or {}
+    email = norm_str(data.get("email"))
+    phone = norm_str(data.get("phone"))
+
+    if email:
+        BOOKINGS[bid]["email"] = email
+    if phone:
+        BOOKINGS[bid]["phone"] = phone
+
+    save_bookings()
+    push_change("upsert", BOOKINGS[bid])
+    return jsonify({"ok": True, "item": BOOKINGS[bid]})
 
 # ==========================
 # ADMIN: CANCELAR
@@ -421,9 +481,9 @@ def admin_block():
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-    date = str(data.get("date", "")).strip()
-    time_ = str(data.get("time", "")).strip()[:5]
-    barber = str(data.get("barber", "")).strip()
+    date = norm_str(data.get("date"))
+    time_ = norm_str(data.get("time"))[:5]
+    barber = norm_str(data.get("barber"))
 
     if not date or not time_ or not barber:
         return bad("Campos obrigatórios: date, time, barber")
@@ -479,12 +539,15 @@ def admin_validate_and_email(bid):
         return bad("not found", 404)
 
     data = request.get_json(silent=True) or {}
-    new_status = (data.get("status") or "Chegou").strip()
+    new_status = norm_str(data.get("status")) or "Chegou"
 
-    # (Opcional) permitir definir email aqui:
-    incoming_email = (data.get("email") or "").strip()
+    # ✅ se vier email/phone aqui, atualiza (sem permitir apagar com vazio)
+    incoming_email = norm_str(data.get("email"))
+    incoming_phone = norm_str(data.get("phone"))
     if incoming_email:
         BOOKINGS[bid]["email"] = incoming_email
+    if incoming_phone:
+        BOOKINGS[bid]["phone"] = incoming_phone
 
     BOOKINGS[bid]["status"] = new_status
     save_bookings()
