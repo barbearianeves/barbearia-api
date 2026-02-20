@@ -1,7 +1,7 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from collections import deque
-import os, time, secrets, json
+import os, time, secrets, json, re
 
 # ✅ email
 import smtplib, ssl, socket
@@ -9,7 +9,31 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+# =========================
+# CORS (robusto p/ preflight + headers custom)
+# =========================
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=False,
+    allow_headers=["Content-Type", "X-Admin-Token", "X-Client-Token"],
+    expose_headers=["Content-Type"],
+    methods=["GET", "POST", "OPTIONS"]
+)
+
+@app.after_request
+def add_cors_headers(resp):
+    # garante headers em todas as respostas (inclui erros)
+    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token, X-Client-Token")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    return resp
+
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def options_any(path):
+    return make_response(("", 204))
 
 # =========================
 # CONFIG / SECRETS
@@ -24,8 +48,19 @@ SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587") or "587")
 SMTP_USER  = (os.environ.get("SMTP_USER", "") or "").strip() or FROM_EMAIL
 SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 
+# ✅ OTP / CLIENT LOGIN
+OTP_TTL_SECONDS = int(os.environ.get("OTP_TTL_SECONDS", "600"))          # 10 min
+OTP_RESEND_SECONDS = int(os.environ.get("OTP_RESEND_SECONDS", "45"))     # 45s
+OTP_LEN = int(os.environ.get("OTP_LEN", "6"))
+DEV_OTP_ECHO = (os.environ.get("DEV_OTP_ECHO", "1").strip() == "1")      # devolve code em JSON p/ testes
+CLIENT_TOKEN_TTL = int(os.environ.get("CLIENT_TOKEN_TTL", "2592000"))    # 30 dias
+
+# Stores
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
+
+OTP_STORE = {}                   # phone -> {code, exp, last_sent, tries}
+CLIENT_SESSIONS = {}             # token -> {phone, exp}
 
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
@@ -41,6 +76,37 @@ def is_admin(req):
 
 def norm_str(x):
     return (x or "").strip()
+
+def norm_phone(p: str) -> str:
+    p = norm_str(p)
+    # mantém só dígitos
+    digits = re.sub(r"\D+", "", p)
+    # aceita PT 9 dígitos ou 351 + 9 dígitos
+    if digits.startswith("351") and len(digits) == 12:
+        return digits
+    if len(digits) == 9:
+        return digits
+    return digits  # devolve o que tiver; vamos validar depois
+
+def gen_otp(n=6):
+    # 6 dígitos por defeito
+    base = 10 ** (n - 1)
+    return str(secrets.randbelow(9 * base) + base)
+
+def client_token_from_header(req):
+    return norm_str(req.headers.get("X-Client-Token"))
+
+def require_client(req):
+    tok = client_token_from_header(req)
+    if not tok:
+        return None, ("missing token", 401)
+    sess = CLIENT_SESSIONS.get(tok)
+    if not sess:
+        return None, ("invalid token", 401)
+    if int(time.time()) > int(sess.get("exp", 0)):
+        CLIENT_SESSIONS.pop(tok, None)
+        return None, ("token expired", 401)
+    return sess, None
 
 # -------------------------
 # ✅ STORAGE: escolher diretório escrevível
@@ -179,6 +245,12 @@ def home():
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES),
         "persist": BOOKINGS_FILE or "NO_PERSIST",
+        "otp": {
+            "ttl": OTP_TTL_SECONDS,
+            "resend": OTP_RESEND_SECONDS,
+            "len": OTP_LEN,
+            "dev_echo": DEV_OTP_ECHO
+        },
         "smtp": {
             "from": FROM_EMAIL,
             "host": SMTP_HOST,
@@ -191,6 +263,85 @@ def home():
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
+
+# =========================
+# ✅ CLIENT LOGIN (OTP)
+# =========================
+@app.post("/client/request_code")
+def client_request_code():
+    data = request.get_json(silent=True) or {}
+    phone_raw = data.get("phone") or data.get("telemovel") or data.get("mobile") or ""
+    phone = norm_phone(phone_raw)
+
+    if len(phone) not in (9, 12):
+        return bad("Telefone inválido (usa 9 dígitos ou 351+9).")
+
+    now = int(time.time())
+    st = OTP_STORE.get(phone) or {}
+
+    last_sent = int(st.get("last_sent", 0) or 0)
+    if last_sent and (now - last_sent) < OTP_RESEND_SECONDS:
+        wait = OTP_RESEND_SECONDS - (now - last_sent)
+        return jsonify({"ok": True, "message": f"Já foi enviado. Tenta novamente em {wait}s."})
+
+    code = gen_otp(OTP_LEN)
+    OTP_STORE[phone] = {
+        "code": code,
+        "exp": now + OTP_TTL_SECONDS,
+        "last_sent": now,
+        "tries": 0
+    }
+
+    # ⚠️ Aqui era onde enviavas SMS (Twilio etc.)
+    # Para já: DEV_MODE pode devolver o código no JSON p/ testes.
+    print(f"[OTP] phone={phone} code={code} exp={OTP_TTL_SECONDS}s", flush=True)
+
+    resp = {"ok": True, "message": "Código enviado."}
+    if DEV_OTP_ECHO:
+        resp["dev_code"] = code
+    return jsonify(resp)
+
+@app.post("/client/verify_code")
+def client_verify_code():
+    data = request.get_json(silent=True) or {}
+    phone_raw = data.get("phone") or data.get("telemovel") or data.get("mobile") or ""
+    code = norm_str(data.get("code") or data.get("codigo") or "")
+
+    phone = norm_phone(phone_raw)
+    if len(phone) not in (9, 12):
+        return bad("Telefone inválido.")
+
+    st = OTP_STORE.get(phone)
+    if not st:
+        return bad("Não existe código para este número. Carrega em 'Receber código'.")
+
+    now = int(time.time())
+    if now > int(st.get("exp", 0)):
+        OTP_STORE.pop(phone, None)
+        return bad("Código expirado. Pede um novo.")
+
+    st["tries"] = int(st.get("tries", 0) or 0) + 1
+    if st["tries"] > 6:
+        OTP_STORE.pop(phone, None)
+        return bad("Muitas tentativas. Pede novo código.", 429)
+
+    if code != str(st.get("code")):
+        return bad("Código errado.")
+
+    # ok -> cria sessão
+    OTP_STORE.pop(phone, None)
+    tok = "c_" + secrets.token_hex(24)
+    CLIENT_SESSIONS[tok] = {"phone": phone, "exp": now + CLIENT_TOKEN_TTL}
+
+    return jsonify({"ok": True, "token": tok, "phone": phone})
+
+@app.get("/client/me")
+def client_me():
+    sess, err = require_client(request)
+    if err:
+        msg, code = err
+        return bad(msg, code)
+    return jsonify({"ok": True, "phone": sess["phone"]})
 
 # -------------------------
 # ✅ ADMIN: TESTE EMAIL
@@ -271,10 +422,6 @@ def pull():
     return jsonify({"ok": True, "cursor": new_cursor, "items": out})
 
 def merge_preserving_contact(old: dict, incoming: dict) -> dict:
-    """
-    ✅ NÃO deixa apagar phone/email se vierem vazios no incoming.
-    (mas permite atualizar se vierem preenchidos)
-    """
     merged = {**(old or {}), **(incoming or {})}
 
     for key in ["phone", "email"]:
@@ -282,17 +429,14 @@ def merge_preserving_contact(old: dict, incoming: dict) -> dict:
         if inc:
             merged[key] = inc
         else:
-            # se incoming não tem valor útil, preserva o antigo
             merged[key] = norm_str((old or {}).get(key))
 
-    # normaliza sempre
     merged["name"] = norm_str(merged.get("name"))
     merged["service"] = norm_str(merged.get("service"))
     merged["barber"] = norm_str(merged.get("barber"))
     merged["date"] = norm_str(merged.get("date"))
     merged["time"] = norm_str(merged.get("time"))[:5]
     merged["status"] = norm_str(merged.get("status")) or "Marcado"
-
     return merged
 
 @app.post("/sync")
@@ -350,7 +494,6 @@ def replace_all():
         bid = norm_str(b.get("id"))
         if not bid:
             continue
-        # também preserva contacto na reposição total
         BOOKINGS[bid] = merge_preserving_contact(old_all.get(bid, {}), b)
 
     save_bookings()
@@ -422,7 +565,6 @@ def admin_list():
     out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
     return jsonify({"ok": True, "items": out})
 
-# ✅ ADMIN: OBTER 1 BOOKING COMPLETO (corrige “não tem email/telemóvel”)
 @app.get("/admin/booking/<bid>")
 def admin_get_booking(bid):
     if not is_admin(request):
@@ -434,7 +576,6 @@ def admin_get_booking(bid):
 
     return jsonify({"ok": True, "item": b})
 
-# ✅ ADMIN: atualizar contacto (se precisares corrigir manualmente)
 @app.post("/admin/update_contact/<bid>")
 def admin_update_contact(bid):
     if not is_admin(request):
@@ -456,9 +597,6 @@ def admin_update_contact(bid):
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True, "item": BOOKINGS[bid]})
 
-# ==========================
-# ADMIN: CANCELAR
-# ==========================
 @app.post("/admin/cancel/<bid>")
 def admin_cancel(bid):
     if not is_admin(request):
@@ -472,9 +610,6 @@ def admin_cancel(bid):
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
-# ==========================
-# ADMIN: BLOQUEAR
-# ==========================
 @app.post("/admin/block")
 def admin_block():
     if not is_admin(request):
@@ -511,9 +646,6 @@ def admin_block():
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
-# ==========================
-# ADMIN: DESBLOQUEAR
-# ==========================
 @app.post("/admin/unblock/<bid>")
 def admin_unblock(bid):
     if not is_admin(request):
@@ -527,9 +659,6 @@ def admin_unblock(bid):
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
-# ==========================
-# ✅ ADMIN: VALIDAR + EMAIL
-# ==========================
 @app.post("/admin/validate_and_email/<bid>")
 def admin_validate_and_email(bid):
     if not is_admin(request):
@@ -541,7 +670,6 @@ def admin_validate_and_email(bid):
     data = request.get_json(silent=True) or {}
     new_status = norm_str(data.get("status")) or "Chegou"
 
-    # ✅ se vier email/phone aqui, atualiza (sem permitir apagar com vazio)
     incoming_email = norm_str(data.get("email"))
     incoming_phone = norm_str(data.get("phone"))
     if incoming_email:
