@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import deque
 import os, time, secrets, json, re
@@ -9,31 +9,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 app = Flask(__name__)
-
-# =========================
-# CORS (robusto p/ preflight + headers custom)
-# =========================
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    supports_credentials=False,
-    allow_headers=["Content-Type", "X-Admin-Token", "X-Client-Token"],
-    expose_headers=["Content-Type"],
-    methods=["GET", "POST", "OPTIONS"]
-)
-
-@app.after_request
-def add_cors_headers(resp):
-    # garante headers em todas as respostas (inclui erros)
-    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
-    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token, X-Client-Token")
-    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    return resp
-
-@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
-@app.route("/<path:path>", methods=["OPTIONS"])
-def options_any(path):
-    return make_response(("", 204))
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # =========================
 # CONFIG / SECRETS
@@ -48,20 +24,12 @@ SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587") or "587")
 SMTP_USER  = (os.environ.get("SMTP_USER", "") or "").strip() or FROM_EMAIL
 SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 
-# ✅ OTP / CLIENT LOGIN
-OTP_TTL_SECONDS = int(os.environ.get("OTP_TTL_SECONDS", "600"))          # 10 min
-OTP_RESEND_SECONDS = int(os.environ.get("OTP_RESEND_SECONDS", "45"))     # 45s
-OTP_LEN = int(os.environ.get("OTP_LEN", "6"))
-DEV_OTP_ECHO = (os.environ.get("DEV_OTP_ECHO", "1").strip() == "1")      # devolve code em JSON p/ testes
-CLIENT_TOKEN_TTL = int(os.environ.get("CLIENT_TOKEN_TTL", "2592000"))    # 30 dias
-
-# Stores
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
 
-OTP_STORE = {}                   # phone -> {code, exp, last_sent, tries}
-CLIENT_SESSIONS = {}             # token -> {phone, exp}
-
+# =========================
+# Helpers
+# =========================
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
 
@@ -77,36 +45,33 @@ def is_admin(req):
 def norm_str(x):
     return (x or "").strip()
 
-def norm_phone(p: str) -> str:
-    p = norm_str(p)
-    # mantém só dígitos
-    digits = re.sub(r"\D+", "", p)
-    # aceita PT 9 dígitos ou 351 + 9 dígitos
-    if digits.startswith("351") and len(digits) == 12:
-        return digits
+def slugify_name(name: str) -> str:
+    s = (name or "").strip()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^0-9A-Za-zÀ-ÿ_]+", "", s)
+    return s[:80] or "Cliente"
+
+def normalize_phone_e164_pt(raw: str) -> str:
+    """
+    Normaliza PT:
+    - '916 634 329' -> '+351916634329'
+    - '00351...' -> '+351...'
+    - '+351...' mantém
+    """
+    s = (raw or "").strip()
+    s = re.sub(r"[^\d+]", "", s)
+    if not s:
+        return ""
+    if s.startswith("00"):
+        s = "+" + s[2:]
+    if s.startswith("+"):
+        digits = re.sub(r"\D", "", s)
+        return "+" + digits
+    digits = re.sub(r"\D", "", s)
     if len(digits) == 9:
-        return digits
-    return digits  # devolve o que tiver; vamos validar depois
-
-def gen_otp(n=6):
-    # 6 dígitos por defeito
-    base = 10 ** (n - 1)
-    return str(secrets.randbelow(9 * base) + base)
-
-def client_token_from_header(req):
-    return norm_str(req.headers.get("X-Client-Token"))
-
-def require_client(req):
-    tok = client_token_from_header(req)
-    if not tok:
-        return None, ("missing token", 401)
-    sess = CLIENT_SESSIONS.get(tok)
-    if not sess:
-        return None, ("invalid token", 401)
-    if int(time.time()) > int(sess.get("exp", 0)):
-        CLIENT_SESSIONS.pop(tok, None)
-        return None, ("token expired", 401)
-    return sess, None
+        return "+351" + digits
+    # fallback genérico
+    return "+" + digits
 
 # -------------------------
 # ✅ STORAGE: escolher diretório escrevível
@@ -135,6 +100,11 @@ def pick_data_dir():
 DATA_DIR = pick_data_dir()
 BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
 
+# ✅ CLIENTES (TXT igual ao C)
+CLIENTS_DIR = os.path.join(DATA_DIR, "clientes") if DATA_DIR else None
+CLIENT_INDEX_FILE = os.path.join(DATA_DIR, "clients_index.json") if DATA_DIR else None  # phone_e164 -> client_id
+LOGIN_CHALLENGES = {}  # challenge_id -> {phone, otp, exp_ts}
+
 def load_bookings():
     global BOOKINGS
     if not BOOKINGS_FILE:
@@ -158,6 +128,21 @@ def save_bookings():
         json.dump(BOOKINGS, f, ensure_ascii=False)
     os.replace(tmp, BOOKINGS_FILE)
 
+def jload(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+def jsave(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
 load_bookings()
 
 # ✅ snapshot em memória (para bridge puxar após restart)
@@ -165,9 +150,193 @@ CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
 
-# -------------------------
+# =========================
+# CLIENTES: storage + index
+# =========================
+def ensure_clients_dir():
+    if not CLIENTS_DIR:
+        return
+    os.makedirs(CLIENTS_DIR, exist_ok=True)
+
+def load_client_index():
+    if not CLIENT_INDEX_FILE:
+        return {}
+    return jload(CLIENT_INDEX_FILE, {})
+
+def save_client_index(idx: dict):
+    if not CLIENT_INDEX_FILE:
+        return
+    jsave(CLIENT_INDEX_FILE, idx)
+
+def next_client_id(existing_ids: set) -> str:
+    # ids tipo "000001"
+    n = 1
+    while True:
+        cid = f"{n:06d}"
+        if cid not in existing_ids:
+            return cid
+        n += 1
+
+def client_folder_path(client_id: str, name: str) -> str:
+    ensure_clients_dir()
+    folder = f"{client_id}_{slugify_name(name)}"
+    return os.path.join(CLIENTS_DIR, folder)
+
+def client_txt_path(client_id: str, name: str) -> str:
+    return os.path.join(client_folder_path(client_id, name), "cliente.txt")
+
+def parse_cliente_txt(path: str) -> dict:
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return out
+
+def write_cliente_txt(client: dict):
+    """
+    Escreve no formato:
+    id=000001
+    nome=...
+    telefone=...
+    email=...
+    profissao=...
+    idade=...
+    notas=... (pode ter \n)
+    foto_antes=
+    foto_depois=
+    """
+    cid = client.get("id")
+    nome = client.get("nome") or "Cliente"
+    path = client_txt_path(cid, nome)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # mantém \n escapado como no teu exemplo
+    notas = (client.get("notas") or "").replace("\r", "").replace("\n", "\\n")
+
+    lines = [
+        f"id={cid}",
+        f"nome={client.get('nome','')}",
+        f"telefone={client.get('telefone','')}",
+        f"email={client.get('email','')}",
+        f"profissao={client.get('profissao','')}",
+        f"idade={client.get('idade','')}",
+        f"notas={notas}",
+        f"foto_antes={client.get('foto_antes','')}",
+        f"foto_depois={client.get('foto_depois','')}",
+    ]
+    content = "\n".join(lines) + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+def find_client_by_id(client_id: str, idx: dict) -> dict:
+    """
+    Procura em disco o cliente.txt pelo id (pasta começa por '{id}_')
+    """
+    ensure_clients_dir()
+    if not CLIENTS_DIR or not os.path.isdir(CLIENTS_DIR):
+        return {}
+
+    prefix = f"{client_id}_"
+    for fn in os.listdir(CLIENTS_DIR):
+        if fn.startswith(prefix):
+            p = os.path.join(CLIENTS_DIR, fn, "cliente.txt")
+            data = parse_cliente_txt(p)
+            if data.get("id") == client_id:
+                return {
+                    "id": data.get("id",""),
+                    "nome": data.get("nome",""),
+                    "telefone": data.get("telefone",""),
+                    "email": data.get("email",""),
+                    "profissao": data.get("profissao",""),
+                    "idade": data.get("idade",""),
+                    "notas": (data.get("notas","") or "").replace("\\n","\n"),
+                    "foto_antes": data.get("foto_antes",""),
+                    "foto_depois": data.get("foto_depois",""),
+                }
+    return {}
+
+def upsert_client(phone_raw: str, name: str = "", email: str = "", client_id: str = "", extra: dict = None):
+    """
+    Regras:
+    - chave principal: telefone normalizado (e164)
+    - se phone existir no index -> usa esse id
+    - se vier client_id (ex: sessão), respeita e atualiza index
+    - nunca cria duplicado do mesmo telefone
+    """
+    ensure_clients_dir()
+    idx = load_client_index()
+
+    phone = normalize_phone_e164_pt(phone_raw)
+    if not phone:
+        return None, "Telefone inválido"
+
+    # existing by phone
+    existing_id = idx.get(phone)
+
+    # carregar conjunto de ids existentes
+    existing_ids = set()
+    if CLIENTS_DIR and os.path.isdir(CLIENTS_DIR):
+        for fn in os.listdir(CLIENTS_DIR):
+            m = re.match(r"^(\d{6})_", fn)
+            if m:
+                existing_ids.add(m.group(1))
+
+    cid = client_id or existing_id
+    created = False
+
+    if not cid:
+        cid = next_client_id(existing_ids)
+        created = True
+
+    # buscar cliente atual (se existir)
+    cur = find_client_by_id(cid, idx) or {
+        "id": cid,
+        "nome": "",
+        "telefone": "",
+        "email": "",
+        "profissao": "",
+        "idade": "",
+        "notas": "",
+        "foto_antes": "",
+        "foto_depois": "",
+    }
+
+    # atualizar campos (sem apagar com vazio)
+    if name and name.strip():
+        cur["nome"] = name.strip()
+    if email and email.strip():
+        cur["email"] = email.strip()
+    if phone:
+        cur["telefone"] = phone
+
+    if extra:
+        # extra sem apagar
+        for k, v in extra.items():
+            if v is None:
+                continue
+            if isinstance(v, str):
+                if v.strip():
+                    cur[k] = v.strip()
+            else:
+                cur[k] = v
+
+    # gravar e indexar
+    write_cliente_txt(cur)
+    idx[phone] = cid
+    save_client_index(idx)
+
+    return {"client": cur, "created": created}, None
+
+# =========================
 # ✅ EMAIL: SMTP por IPv4 + logs
-# -------------------------
+# =========================
 def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
     ipv4 = None
     try:
@@ -245,12 +414,8 @@ def home():
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES),
         "persist": BOOKINGS_FILE or "NO_PERSIST",
-        "otp": {
-            "ttl": OTP_TTL_SECONDS,
-            "resend": OTP_RESEND_SECONDS,
-            "len": OTP_LEN,
-            "dev_echo": DEV_OTP_ECHO
-        },
+        "data_dir": DATA_DIR,
+        "clients_dir": CLIENTS_DIR,
         "smtp": {
             "from": FROM_EMAIL,
             "host": SMTP_HOST,
@@ -265,83 +430,88 @@ def health():
     return jsonify({"ok": True})
 
 # =========================
-# ✅ CLIENT LOGIN (OTP)
+# CLIENT: LOGIN (OTP simples)
 # =========================
-@app.post("/client/request_code")
-def client_request_code():
+@app.post("/client/start_login")
+def client_start_login():
     data = request.get_json(silent=True) or {}
-    phone_raw = data.get("phone") or data.get("telemovel") or data.get("mobile") or ""
-    phone = norm_phone(phone_raw)
+    phone = normalize_phone_e164_pt(norm_str(data.get("phone")))
+    if not phone:
+        return bad("Telefone inválido")
 
-    if len(phone) not in (9, 12):
-        return bad("Telefone inválido (usa 9 dígitos ou 351+9).")
+    # gera otp
+    otp = f"{secrets.randbelow(1000000):06d}"
+    challenge_id = now_id()
+    exp = int(time.time()) + 5 * 60  # 5 min
 
-    now = int(time.time())
-    st = OTP_STORE.get(phone) or {}
-
-    last_sent = int(st.get("last_sent", 0) or 0)
-    if last_sent and (now - last_sent) < OTP_RESEND_SECONDS:
-        wait = OTP_RESEND_SECONDS - (now - last_sent)
-        return jsonify({"ok": True, "message": f"Já foi enviado. Tenta novamente em {wait}s."})
-
-    code = gen_otp(OTP_LEN)
-    OTP_STORE[phone] = {
-        "code": code,
-        "exp": now + OTP_TTL_SECONDS,
-        "last_sent": now,
-        "tries": 0
+    LOGIN_CHALLENGES[challenge_id] = {
+        "phone": phone,
+        "otp": otp,
+        "exp": exp
     }
 
-    # ⚠️ Aqui era onde enviavas SMS (Twilio etc.)
-    # Para já: DEV_MODE pode devolver o código no JSON p/ testes.
-    print(f"[OTP] phone={phone} code={code} exp={OTP_TTL_SECONDS}s", flush=True)
+    # para já devolvemos otp_debug para testes
+    return jsonify({"ok": True, "challenge_id": challenge_id, "otp_debug": otp})
 
-    resp = {"ok": True, "message": "Código enviado."}
-    if DEV_OTP_ECHO:
-        resp["dev_code"] = code
-    return jsonify(resp)
-
-@app.post("/client/verify_code")
-def client_verify_code():
+@app.post("/client/verify_login")
+def client_verify_login():
     data = request.get_json(silent=True) or {}
-    phone_raw = data.get("phone") or data.get("telemovel") or data.get("mobile") or ""
-    code = norm_str(data.get("code") or data.get("codigo") or "")
+    challenge_id = norm_str(data.get("challenge_id"))
+    code = norm_str(data.get("code"))
+    name = norm_str(data.get("name"))
+    email = norm_str(data.get("email"))
 
-    phone = norm_phone(phone_raw)
-    if len(phone) not in (9, 12):
-        return bad("Telefone inválido.")
+    if not challenge_id or not code:
+        return bad("challenge_id e code são obrigatórios")
 
-    st = OTP_STORE.get(phone)
-    if not st:
-        return bad("Não existe código para este número. Carrega em 'Receber código'.")
+    ch = LOGIN_CHALLENGES.get(challenge_id)
+    if not ch:
+        return bad("challenge inválido", 401)
 
-    now = int(time.time())
-    if now > int(st.get("exp", 0)):
-        OTP_STORE.pop(phone, None)
-        return bad("Código expirado. Pede um novo.")
+    if int(time.time()) > int(ch.get("exp", 0)):
+        LOGIN_CHALLENGES.pop(challenge_id, None)
+        return bad("código expirou", 401)
 
-    st["tries"] = int(st.get("tries", 0) or 0) + 1
-    if st["tries"] > 6:
-        OTP_STORE.pop(phone, None)
-        return bad("Muitas tentativas. Pede novo código.", 429)
+    if code != ch.get("otp"):
+        return bad("código errado", 401)
 
-    if code != str(st.get("code")):
-        return bad("Código errado.")
-
-    # ok -> cria sessão
-    OTP_STORE.pop(phone, None)
-    tok = "c_" + secrets.token_hex(24)
-    CLIENT_SESSIONS[tok] = {"phone": phone, "exp": now + CLIENT_TOKEN_TTL}
-
-    return jsonify({"ok": True, "token": tok, "phone": phone})
-
-@app.get("/client/me")
-def client_me():
-    sess, err = require_client(request)
+    phone = ch["phone"]
+    # ok: devolve cliente existente ou cria novo
+    r, err = upsert_client(phone_raw=phone, name=name or "", email=email or "", client_id="")
+    LOGIN_CHALLENGES.pop(challenge_id, None)
     if err:
-        msg, code = err
-        return bad(msg, code)
-    return jsonify({"ok": True, "phone": sess["phone"]})
+        return bad(err)
+
+    client = r["client"]
+    return jsonify({"ok": True, "created": r["created"], "client": client})
+
+@app.get("/client/<client_id>")
+def client_get(client_id):
+    cid = norm_str(client_id)
+    if not cid:
+        return bad("id inválido")
+    idx = load_client_index()
+    c = find_client_by_id(cid, idx)
+    if not c:
+        return bad("not found", 404)
+    return jsonify({"ok": True, "client": c})
+
+@app.post("/client/upsert")
+def client_upsert():
+    data = request.get_json(silent=True) or {}
+    cid = norm_str(data.get("id"))
+    phone = norm_str(data.get("phone"))
+    name = norm_str(data.get("name"))
+    email = norm_str(data.get("email"))
+
+    # phone é obrigatório para não haver duplicados
+    if not phone:
+        return bad("phone obrigatório")
+
+    r, err = upsert_client(phone_raw=phone, name=name, email=email, client_id=cid or "")
+    if err:
+        return bad(err)
+    return jsonify({"ok": True, "created": r["created"], "client": r["client"]})
 
 # -------------------------
 # ✅ ADMIN: TESTE EMAIL
@@ -368,6 +538,66 @@ def admin_test_email():
     ok, msg = send_validation_email(fake_booking, subject="✅ Teste SMTP - Barbearia")
     return jsonify({"ok": ok, "message": msg})
 
+# =========================
+# BOOKINGS: merge preservando contacto + puxando do cliente
+# =========================
+def merge_preserving_contact(old: dict, incoming: dict) -> dict:
+    """
+    ✅ NÃO deixa apagar phone/email se vierem vazios no incoming.
+    (mas permite atualizar se vierem preenchidos)
+    """
+    merged = {**(old or {}), **(incoming or {})}
+
+    for key in ["phone", "email"]:
+        inc = norm_str((incoming or {}).get(key))
+        if inc:
+            merged[key] = inc
+        else:
+            merged[key] = norm_str((old or {}).get(key))
+
+    # normaliza sempre
+    merged["name"] = norm_str(merged.get("name"))
+    merged["service"] = norm_str(merged.get("service"))
+    merged["barber"] = norm_str(merged.get("barber"))
+    merged["date"] = norm_str(merged.get("date"))
+    merged["time"] = norm_str(merged.get("time"))[:5]
+    merged["status"] = norm_str(merged.get("status")) or "Marcado"
+
+    return merged
+
+def hydrate_contact_from_client(booking: dict) -> dict:
+    """
+    ✅ Se booking vem com client_id mas sem phone/email (ou vazios),
+    vai buscar ao cliente.txt e completa.
+    """
+    b = dict(booking or {})
+    cid = norm_str(b.get("client_id"))
+    if not cid:
+        return b
+
+    need_phone = not norm_str(b.get("phone"))
+    need_email = not norm_str(b.get("email"))
+    if not (need_phone or need_email):
+        return b
+
+    idx = load_client_index()
+    c = find_client_by_id(cid, idx)
+    if not c:
+        return b
+
+    if need_phone and norm_str(c.get("telefone")):
+        b["phone"] = norm_str(c.get("telefone"))
+    if need_email and norm_str(c.get("email")):
+        b["email"] = norm_str(c.get("email"))
+
+    # nome também
+    if not norm_str(b.get("name")) and norm_str(c.get("nome")):
+        b["name"] = norm_str(c.get("nome"))
+    if not norm_str(b.get("client")) and norm_str(c.get("nome")):
+        b["client"] = norm_str(c.get("nome"))
+
+    return b
+
 # -------------------------
 # CLIENTE: CRIAR MARCAÇÃO
 # -------------------------
@@ -382,11 +612,27 @@ def book():
     t = norm_str(str(data["time"]))[:5]
     bid = norm_str(data.get("id")) or now_id()
 
+    phone_norm = normalize_phone_e164_pt(norm_str(data.get("phone")))
+    if not phone_norm:
+        return bad("Telefone inválido")
+
+    # ✅ upsert cliente para garantir que existe e evitar duplicado
+    client_id_in = norm_str(data.get("client_id"))
+    r, err = upsert_client(
+        phone_raw=phone_norm,
+        name=norm_str(data.get("name")),
+        email=norm_str(data.get("email")),
+        client_id=client_id_in
+    )
+    if err:
+        return bad(err)
+    client = r["client"]
+
     item = {
         "id": bid,
-        "name": norm_str(data.get("name")),
-        "phone": norm_str(data.get("phone")),
-        "email": norm_str(data.get("email")),
+        "name": norm_str(data.get("name")) or norm_str(client.get("nome")),
+        "phone": phone_norm,
+        "email": norm_str(data.get("email")) or norm_str(client.get("email")),
         "service": norm_str(data.get("service")),
         "barber": norm_str(data.get("barber")),
         "date": norm_str(data.get("date")),
@@ -394,15 +640,15 @@ def book():
         "dur": int(float(data.get("dur", 30))),
         "notes": norm_str(data.get("notes")),
         "status": "Marcado",
-        "client_id": norm_str(data.get("client_id")),
-        "client": norm_str(data.get("client")),
+        "client_id": norm_str(client.get("id")),
+        "client": norm_str(data.get("client")) or norm_str(client.get("nome")),
         "created_at": int(time.time())
     }
 
     BOOKINGS[bid] = item
     save_bookings()
     push_change("upsert", item)
-    return jsonify({"ok": True, "id": bid})
+    return jsonify({"ok": True, "id": bid, "client_id": item["client_id"]})
 
 # -------------------------
 # BRIDGE: PULL / SYNC
@@ -420,24 +666,6 @@ def pull():
     out = changes_list[cursor: cursor + limit]
     new_cursor = min(cursor + len(out), len(changes_list))
     return jsonify({"ok": True, "cursor": new_cursor, "items": out})
-
-def merge_preserving_contact(old: dict, incoming: dict) -> dict:
-    merged = {**(old or {}), **(incoming or {})}
-
-    for key in ["phone", "email"]:
-        inc = norm_str((incoming or {}).get(key))
-        if inc:
-            merged[key] = inc
-        else:
-            merged[key] = norm_str((old or {}).get(key))
-
-    merged["name"] = norm_str(merged.get("name"))
-    merged["service"] = norm_str(merged.get("service"))
-    merged["barber"] = norm_str(merged.get("barber"))
-    merged["date"] = norm_str(merged.get("date"))
-    merged["time"] = norm_str(merged.get("time"))[:5]
-    merged["status"] = norm_str(merged.get("status")) or "Marcado"
-    return merged
 
 @app.post("/sync")
 def sync():
@@ -468,7 +696,9 @@ def sync():
 
         elif op == "upsert":
             old = BOOKINGS.get(bid, {})
-            BOOKINGS[bid] = merge_preserving_contact(old, payload)
+            merged = merge_preserving_contact(old, payload)
+            merged = hydrate_contact_from_client(merged)  # ✅ completa contacto se faltar
+            BOOKINGS[bid] = merged
             save_bookings()
             push_change("upsert", BOOKINGS[bid])
             applied += 1
@@ -494,7 +724,9 @@ def replace_all():
         bid = norm_str(b.get("id"))
         if not bid:
             continue
-        BOOKINGS[bid] = merge_preserving_contact(old_all.get(bid, {}), b)
+        merged = merge_preserving_contact(old_all.get(bid, {}), b)
+        merged = hydrate_contact_from_client(merged)
+        BOOKINGS[bid] = merged
 
     save_bookings()
 
@@ -565,6 +797,7 @@ def admin_list():
     out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
     return jsonify({"ok": True, "items": out})
 
+# ✅ ADMIN: OBTER 1 BOOKING COMPLETO
 @app.get("/admin/booking/<bid>")
 def admin_get_booking(bid):
     if not is_admin(request):
@@ -574,8 +807,13 @@ def admin_get_booking(bid):
     if not b:
         return bad("not found", 404)
 
-    return jsonify({"ok": True, "item": b})
+    # garante contacto caso venha vazio
+    b2 = hydrate_contact_from_client(b)
+    BOOKINGS[bid] = b2
+    save_bookings()
+    return jsonify({"ok": True, "item": b2})
 
+# ✅ ADMIN: atualizar contacto
 @app.post("/admin/update_contact/<bid>")
 def admin_update_contact(bid):
     if not is_admin(request):
@@ -588,15 +826,21 @@ def admin_update_contact(bid):
     email = norm_str(data.get("email"))
     phone = norm_str(data.get("phone"))
 
+    if phone:
+        p = normalize_phone_e164_pt(phone)
+        if not p:
+            return bad("telefone inválido")
+        BOOKINGS[bid]["phone"] = p
     if email:
         BOOKINGS[bid]["email"] = email
-    if phone:
-        BOOKINGS[bid]["phone"] = phone
 
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True, "item": BOOKINGS[bid]})
 
+# ==========================
+# ADMIN: CANCELAR
+# ==========================
 @app.post("/admin/cancel/<bid>")
 def admin_cancel(bid):
     if not is_admin(request):
@@ -610,6 +854,9 @@ def admin_cancel(bid):
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
+# ==========================
+# ADMIN: BLOQUEAR
+# ==========================
 @app.post("/admin/block")
 def admin_block():
     if not is_admin(request):
@@ -646,6 +893,9 @@ def admin_block():
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
+# ==========================
+# ADMIN: DESBLOQUEAR
+# ==========================
 @app.post("/admin/unblock/<bid>")
 def admin_unblock(bid):
     if not is_admin(request):
@@ -659,6 +909,9 @@ def admin_unblock(bid):
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
+# ==========================
+# ✅ ADMIN: VALIDAR + EMAIL
+# ==========================
 @app.post("/admin/validate_and_email/<bid>")
 def admin_validate_and_email(bid):
     if not is_admin(request):
@@ -675,9 +928,15 @@ def admin_validate_and_email(bid):
     if incoming_email:
         BOOKINGS[bid]["email"] = incoming_email
     if incoming_phone:
-        BOOKINGS[bid]["phone"] = incoming_phone
+        p = normalize_phone_e164_pt(incoming_phone)
+        if p:
+            BOOKINGS[bid]["phone"] = p
 
     BOOKINGS[bid]["status"] = new_status
+
+    # ✅ garante contacto pelo cliente_id se faltar
+    BOOKINGS[bid] = hydrate_contact_from_client(BOOKINGS[bid])
+
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
 
