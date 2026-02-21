@@ -17,7 +17,7 @@ CORS(
 # CONFIG / SECRETS
 # =========================
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345").strip()
-ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "barbeiro-2026").strip()
+ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "neves-12345").strip()
 
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
