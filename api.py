@@ -37,6 +37,10 @@ def push_change(op, payload):
 def is_admin(req):
     return (req.headers.get("X-Admin-Token", "") or "").strip() == ADMIN_TOKEN
 
+def is_bridge(req):
+    secret = (req.args.get("secret", "") or "").strip()
+    return secret == BRIDGE_SECRET
+
 def norm_str(x):
     return (x or "").strip()
 
@@ -424,7 +428,6 @@ def admin_bookings():
             continue
         items.append(b)
 
-    # ordenar por hora
     items.sort(key=lambda x: (x.get("date",""), x.get("time","")))
     return jsonify({"ok": True, "items": items})
 
@@ -483,7 +486,6 @@ def admin_unblock(bid):
     if not b:
         return bad("not found", 404)
 
-    # marcar como desbloqueado (fica histórico mas não aparece)
     b["status"] = "Desbloqueado"
     BOOKINGS[bid] = b
     save_bookings()
@@ -505,6 +507,138 @@ def admin_cancel(bid):
     save_bookings()
     push_change("upsert", b)
     return jsonify({"ok": True})
+
+# =========================
+# ✅ BRIDGE ENDPOINTS
+# =========================
+@app.get("/pull")
+def bridge_pull():
+    if not is_bridge(request):
+        return bad("unauthorized", 401)
+
+    try:
+        cursor = int(request.args.get("cursor", "0") or "0")
+    except Exception:
+        cursor = 0
+    try:
+        limit = int(request.args.get("limit", "300") or "300")
+    except Exception:
+        limit = 300
+
+    if cursor < 0:
+        cursor = 0
+    if limit < 1:
+        limit = 1
+    if limit > 2000:
+        limit = 2000
+
+    changes = list(CHANGES)
+    batch = changes[cursor: cursor + limit]
+    next_cursor = cursor + len(batch)
+
+    return jsonify({"ok": True, "items": batch, "cursor": next_cursor})
+
+@app.post("/sync")
+def bridge_sync():
+    if not is_bridge(request):
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    changes = data.get("changes") or []
+    if not isinstance(changes, list):
+        return bad("changes deve ser lista")
+
+    applied = 0
+
+    for ev in changes:
+        if not isinstance(ev, dict):
+            continue
+        op = (ev.get("op") or "").strip()
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        bid = norm_str(payload.get("id"))
+        if not bid:
+            continue
+
+        if op == "delete":
+            if bid in BOOKINGS:
+                BOOKINGS.pop(bid, None)
+                applied += 1
+            push_change("delete", {"id": bid})
+            continue
+
+        if op == "upsert":
+            cur = BOOKINGS.get(bid, {})
+            if not isinstance(cur, dict):
+                cur = {}
+            cur.update(payload)
+
+            if cur.get("phone"):
+                cur["phone"] = normalize_phone_pt9(cur.get("phone"))
+            if cur.get("email"):
+                cur["email"] = norm_email(cur.get("email"))
+            if cur.get("time"):
+                cur["time"] = norm_str(cur.get("time"))[:5]
+            if cur.get("dur") is not None:
+                try:
+                    cur["dur"] = int(float(cur.get("dur")))
+                except Exception:
+                    cur["dur"] = 45
+            if not cur.get("created_at"):
+                cur["created_at"] = int(time.time())
+
+            BOOKINGS[bid] = cur
+            push_change("upsert", cur)
+            applied += 1
+            continue
+
+    save_bookings()
+    return jsonify({"ok": True, "applied": applied})
+
+@app.post("/replace_all")
+def bridge_replace_all():
+    if not is_bridge(request):
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        return bad("items deve ser lista")
+
+    BOOKINGS.clear()
+
+    for b in items:
+        if not isinstance(b, dict):
+            continue
+        bid = norm_str(b.get("id"))
+        if not bid:
+            continue
+
+        if b.get("phone"):
+            b["phone"] = normalize_phone_pt9(b.get("phone"))
+        if b.get("email"):
+            b["email"] = norm_email(b.get("email"))
+        if b.get("time"):
+            b["time"] = norm_str(b.get("time"))[:5]
+        if b.get("dur") is not None:
+            try:
+                b["dur"] = int(float(b.get("dur")))
+            except Exception:
+                b["dur"] = 45
+        if not b.get("created_at"):
+            b["created_at"] = int(time.time())
+
+        BOOKINGS[bid] = b
+
+    save_bookings()
+
+    CHANGES.clear()
+    for b in BOOKINGS.values():
+        push_change("upsert", b)
+
+    return jsonify({"ok": True, "count": len(BOOKINGS)})
 
 # =========================
 # RUN
