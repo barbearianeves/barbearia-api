@@ -67,7 +67,6 @@ def normalize_phone_pt9(raw: str) -> str:
     digits = re.sub(r"\D", "", s)
     if digits.startswith("351") and len(digits) >= 12:
         digits = digits[3:]
-    # Fica com últimos 9 (para casos com prefixos)
     if len(digits) > 9:
         digits = digits[-9:]
     if len(digits) != 9:
@@ -110,7 +109,7 @@ BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
 CLIENTS_DIR = os.path.join(DATA_DIR, "clientes") if DATA_DIR else None
 CLIENT_INDEX_FILE = os.path.join(DATA_DIR, "clients_index.json") if DATA_DIR else None  # phone9 -> client_id
 
-# ✅ LOGIN CHALLENGES persistente (para não falhar em restart)
+# ✅ (mantido por compat, mas NÃO é usado)
 LOGIN_CHALLENGES_FILE = os.path.join(DATA_DIR, "login_challenges.json") if DATA_DIR else None
 
 def jload(path, default):
@@ -212,7 +211,6 @@ def find_client_by_id(client_id: str) -> dict:
             p = os.path.join(CLIENTS_DIR, fn, "cliente.txt")
             data = parse_cliente_txt(p)
             if data.get("id") == client_id:
-                # ✅ telefone guardado como 9 dígitos
                 tel9 = normalize_phone_pt9(data.get("telefone", ""))
                 return {
                     "id": data.get("id",""),
@@ -323,34 +321,10 @@ def upsert_client_profile(client_id: str, phone9: str, name: str, email: str = "
 
     write_cliente_txt(client)
 
-    # devolver já com phone_e164
     out = dict(client)
     out["telefone"] = phone9
     out["phone_e164"] = phone9_to_e164(phone9)
     return out, created, ""
-
-# =========================
-# LOGIN CHALLENGES (persist)
-# =========================
-def load_login_challenges():
-    ch = jload(LOGIN_CHALLENGES_FILE, {})
-    if not isinstance(ch, dict):
-        return {}
-    # limpar expirados
-    now = int(time.time())
-    out = {}
-    for k, v in ch.items():
-        try:
-            if int(v.get("exp", 0)) > now:
-                out[k] = v
-        except Exception:
-            continue
-    if out != ch:
-        jsave(LOGIN_CHALLENGES_FILE, out)
-    return out
-
-def save_login_challenges(ch: dict):
-    jsave(LOGIN_CHALLENGES_FILE, ch)
 
 # =========================
 # EMAIL (igual ao teu)
@@ -443,58 +417,24 @@ def health():
     return jsonify({"ok": True})
 
 # =========================
-# CLIENT: LOGIN (OTP)
+# ✅ CLIENT: LOGIN SIMPLES (SEM CÓDIGOS)
+# - envia só {phone: "916..." ou "+351916..."}
+# - se existir: devolve client completo
+# - se não existir: cria id e devolve skeleton (sem nome) => front vai criar perfil
 # =========================
-@app.post("/client/start_login")
-def client_start_login():
+@app.post("/client/login")
+def client_login_simple():
     data = request.get_json(silent=True) or {}
     phone9 = normalize_phone_pt9(norm_str(data.get("phone")))
     if not phone9:
         return bad("Telefone inválido (usa 9 dígitos PT)")
 
-    otp = f"{secrets.randbelow(1000000):06d}"
-    challenge_id = now_id()
-    exp = int(time.time()) + 5 * 60
-
-    ch = load_login_challenges()
-    ch[challenge_id] = {"phone9": phone9, "otp": otp, "exp": exp}
-    save_login_challenges(ch)
-
-    return jsonify({"ok": True, "challenge_id": challenge_id, "otp_debug": otp})
-
-@app.post("/client/verify_login")
-def client_verify_login():
-    data = request.get_json(silent=True) or {}
-    challenge_id = norm_str(data.get("challenge_id"))
-    code = norm_str(data.get("code"))
-
-    if not challenge_id or not code:
-        return bad("challenge_id e code são obrigatórios")
-
-    ch = load_login_challenges()
-    rec = ch.get(challenge_id)
-    if not rec:
-        return bad("challenge inválido", 401)
-
-    if int(time.time()) > int(rec.get("exp", 0)):
-        ch.pop(challenge_id, None)
-        save_login_challenges(ch)
-        return bad("código expirou", 401)
-
-    if code != rec.get("otp"):
-        return bad("código errado", 401)
-
-    phone9 = rec["phone9"]
     client_id, existing = get_or_create_client_id_by_phone9(phone9)
-
-    # limpar challenge
-    ch.pop(challenge_id, None)
-    save_login_challenges(ch)
 
     if existing:
         client = find_client_by_id(client_id)
-        # ✅ se por algum motivo faltar o txt, ainda assim devolve estrutura
         if not client:
+            # índice existe mas txt não; devolve estrutura mínima
             client = {
                 "id": client_id,
                 "nome": "",
@@ -524,6 +464,15 @@ def client_verify_login():
     }
     return jsonify({"ok": True, "existing": False, "client": client})
 
+# (mantive endpoints antigos por compatibilidade; podes apagar se quiseres)
+@app.post("/client/start_login")
+def client_start_login_disabled():
+    return bad("Login por código foi desativado. Usa /client/login", 410)
+
+@app.post("/client/verify_login")
+def client_verify_login_disabled():
+    return bad("Login por código foi desativado. Usa /client/login", 410)
+
 @app.get("/client/<client_id>")
 def client_get(client_id):
     cid = norm_str(client_id)
@@ -536,9 +485,6 @@ def client_get(client_id):
 
 @app.get("/client/by_phone")
 def client_by_phone():
-    """
-    Útil para debug/bridge: /client/by_phone?phone=916...
-    """
     p9 = normalize_phone_pt9(request.args.get("phone",""))
     if not p9:
         return bad("telefone inválido")
@@ -555,6 +501,8 @@ def client_by_phone():
 def client_upsert():
     data = request.get_json(silent=True) or {}
     cid = norm_str(data.get("id"))
+
+    # aceita phone em 9 dígitos ou e164
     phone9 = normalize_phone_pt9(norm_str(data.get("phone")))
     name = norm_str(data.get("name"))
     email = norm_email(data.get("email"))
@@ -601,7 +549,6 @@ def hydrate_contact_from_client(booking: dict) -> dict:
     if not c:
         return b
 
-    # phone guardado sempre como 9 dígitos
     if not norm_str(b.get("phone")) and norm_str(c.get("telefone")):
         b["phone"] = norm_str(c.get("telefone"))
     if not norm_str(b.get("email")) and norm_str(c.get("email")):
@@ -620,7 +567,7 @@ def hydrate_contact_from_client(booking: dict) -> dict:
 def book():
     data = request.get_json(silent=True) or {}
 
-    # ✅ agora phone é sempre 9 dígitos (podes mandar e164 na mesma)
+    # ✅ phone é sempre 9 dígitos
     phone9 = normalize_phone_pt9(norm_str(data.get("phone")))
     if not phone9:
         return bad("Telefone inválido")
@@ -641,7 +588,7 @@ def book():
     item = {
         "id": bid,
         "name": norm_str(data.get("name")) or norm_str(c.get("nome")),
-        "phone": phone9,  # ✅ 9 dígitos
+        "phone": phone9,
         "email": norm_email(data.get("email")) or norm_email(c.get("email")),
         "service": norm_str(data.get("service")),
         "barber": norm_str(data.get("barber")),
@@ -708,7 +655,6 @@ def sync():
             old = BOOKINGS.get(bid, {})
             merged = merge_preserving_contact(old, payload)
 
-            # normalizar phone para 9 dígitos sempre
             if merged.get("phone"):
                 merged["phone"] = normalize_phone_pt9(merged.get("phone"))
 
@@ -797,7 +743,7 @@ def busy():
     return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
 # =========================
-# ADMIN (fica igual ao teu – cortei para não ficar gigante)
+# ADMIN (exemplo mínimo)
 # =========================
 @app.post("/admin/test_email")
 def admin_test_email():
