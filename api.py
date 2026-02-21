@@ -1,11 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from collections import deque
-import os, time, secrets, json, re
+import os, time, secrets, json, re, sqlite3
 
 app = Flask(__name__)
 
-# ✅ IMPORTANTE: permitir header X-Admin-Token
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
@@ -19,9 +17,6 @@ CORS(
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345").strip()
 ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "neves-12345").strip()
 
-BOOKINGS = {}                    # id -> booking dict (persistente)
-CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
-
 # =========================
 # Helpers
 # =========================
@@ -30,9 +25,6 @@ def now_id():
 
 def bad(msg, code=400):
     return jsonify({"error": msg}), code
-
-def push_change(op, payload):
-    CHANGES.append({"op": op, "payload": payload, "ts": int(time.time())})
 
 def is_admin(req):
     return (req.headers.get("X-Admin-Token", "") or "").strip() == ADMIN_TOKEN
@@ -64,15 +56,20 @@ def normalize_phone_pt9(raw: str) -> str:
         digits = digits[-9:]
     return digits if len(digits) == 9 else ""
 
+def norm_time_hhmm(raw: str) -> str:
+    t = (raw or "").strip()
+    if len(t) >= 5:
+        t = t[:5]
+    return t
+
 # -------------------------
-# STORAGE: escolher diretório escrevível
+# STORAGE: SQLite (um ficheiro)
 # -------------------------
 def pick_data_dir():
     cand = (os.environ.get("DATA_DIR", "") or "").strip()
     candidates = []
     if cand:
         candidates.append(cand)
-
     candidates.append(os.path.join(os.path.dirname(__file__), "data"))
     candidates.append("/tmp/barbearia_data")
 
@@ -89,152 +86,189 @@ def pick_data_dir():
     return None
 
 DATA_DIR = pick_data_dir()
-BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
+DB_PATH  = os.path.join(DATA_DIR, "barbearia.sqlite") if DATA_DIR else ":memory:"
 
-CLIENTS_DIR = os.path.join(DATA_DIR, "clientes") if DATA_DIR else None
-CLIENT_INDEX_FILE = os.path.join(DATA_DIR, "clients_index.json") if DATA_DIR else None  # phone9 -> client_id
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def jload(path, default):
-    try:
-        if path and os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
+def db_init():
+    conn = db()
+    cur = conn.cursor()
 
-def jsave(path, obj):
-    if not path:
-        return
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    # bookings
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bookings (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL
+    )
+    """)
 
-def load_bookings():
-    global BOOKINGS
-    if not BOOKINGS_FILE:
-        BOOKINGS = {}
-        return
-    BOOKINGS = jload(BOOKINGS_FILE, {})
-    if not isinstance(BOOKINGS, dict):
-        BOOKINGS = {}
+    # clients (perfil)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS clients (
+      id TEXT PRIMARY KEY,
+      phone9 TEXT UNIQUE,
+      name TEXT,
+      email TEXT,
+      data TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+    """)
 
-def save_bookings():
-    if not BOOKINGS_FILE:
-        return
-    tmp = BOOKINGS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(BOOKINGS, f, ensure_ascii=False)
-    os.replace(tmp, BOOKINGS_FILE)
+    # phone index (login)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS phone_index (
+      phone9 TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL
+    )
+    """)
 
-def ensure_clients_dir():
-    if CLIENTS_DIR:
-        os.makedirs(CLIENTS_DIR, exist_ok=True)
+    # changes feed (bookings) para bridge
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS changes (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      op TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      ts INTEGER NOT NULL
+    )
+    """)
 
-def load_client_index():
-    if not CLIENT_INDEX_FILE:
-        return {}
-    idx = jload(CLIENT_INDEX_FILE, {})
-    return idx if isinstance(idx, dict) else {}
+    # changes feed (clients) para bridge
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS client_changes (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      op TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      ts INTEGER NOT NULL
+    )
+    """)
 
-def save_client_index(idx: dict):
-    if CLIENT_INDEX_FILE:
-        jsave(CLIENT_INDEX_FILE, idx)
+    conn.commit()
+    conn.close()
 
-def list_existing_client_ids() -> set:
-    ensure_clients_dir()
-    ids = set()
-    if CLIENTS_DIR and os.path.isdir(CLIENTS_DIR):
-        for fn in os.listdir(CLIENTS_DIR):
-            m = re.match(r"^(\d{6})_", fn)
-            if m:
-                ids.add(m.group(1))
-    return ids
+db_init()
 
-def next_client_id(existing_ids: set) -> str:
-    n = 1
-    while True:
-        cid = f"{n:06d}"
-        if cid not in existing_ids:
-            return cid
-        n += 1
+def push_change(op: str, payload: dict):
+    conn = db()
+    conn.execute(
+        "INSERT INTO changes(op,payload,ts) VALUES(?,?,?)",
+        (op, json.dumps(payload, ensure_ascii=False), int(time.time()))
+    )
+    conn.commit()
+    conn.close()
 
-def client_folder_path(client_id: str, name: str) -> str:
-    ensure_clients_dir()
-    folder = f"{client_id}_{slugify_name(name)}"
-    return os.path.join(CLIENTS_DIR, folder)
+def push_client_change(op: str, payload: dict):
+    conn = db()
+    conn.execute(
+        "INSERT INTO client_changes(op,payload,ts) VALUES(?,?,?)",
+        (op, json.dumps(payload, ensure_ascii=False), int(time.time()))
+    )
+    conn.commit()
+    conn.close()
 
-def client_txt_path(client_id: str, name: str) -> str:
-    return os.path.join(client_folder_path(client_id, name), "cliente.txt")
+def db_put_booking(b: dict):
+    bid = norm_str(b.get("id"))
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO bookings(id,data) VALUES(?,?)",
+                 (bid, json.dumps(b, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
 
-def parse_cliente_txt(path: str) -> dict:
-    out = {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                out[k.strip()] = v.strip()
-    except Exception:
-        pass
+def db_del_booking(bid: str):
+    conn = db()
+    conn.execute("DELETE FROM bookings WHERE id=?", (bid,))
+    conn.commit()
+    conn.close()
+
+def db_all_bookings() -> list:
+    conn = db()
+    rows = conn.execute("SELECT data FROM bookings").fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r["data"]))
+        except Exception:
+            pass
     return out
 
-def find_client_by_id(client_id: str) -> dict:
-    ensure_clients_dir()
-    if not CLIENTS_DIR or not os.path.isdir(CLIENTS_DIR):
+def db_get_booking(bid: str) -> dict:
+    conn = db()
+    row = conn.execute("SELECT data FROM bookings WHERE id=?", (bid,)).fetchone()
+    conn.close()
+    if not row:
+        return {}
+    try:
+        return json.loads(row["data"])
+    except Exception:
         return {}
 
-    prefix = f"{client_id}_"
-    for fn in os.listdir(CLIENTS_DIR):
-        if fn.startswith(prefix):
-            p = os.path.join(CLIENTS_DIR, fn, "cliente.txt")
-            data = parse_cliente_txt(p)
-            if data.get("id") == client_id:
-                tel9 = normalize_phone_pt9(data.get("telefone", ""))
-                return {
-                    "id": data.get("id",""),
-                    "nome": data.get("nome",""),
-                    "telefone": tel9,
-                    "email": data.get("email",""),
-                }
-    return {}
+def db_bookings_count() -> int:
+    conn = db()
+    row = conn.execute("SELECT COUNT(*) AS n FROM bookings").fetchone()
+    conn.close()
+    return int(row["n"] or 0)
 
-def write_cliente_txt(client: dict):
-    cid = client.get("id") or ""
-    nome = (client.get("nome") or "Cliente").strip()
-    tel9 = normalize_phone_pt9(client.get("telefone") or client.get("phone") or "")
-    email = norm_email(client.get("email"))
-
-    path = client_txt_path(cid, nome)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    lines = [
-        f"id={cid}",
-        f"nome={nome}",
-        f"telefone={tel9}",
-        f"email={email}",
-    ]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+# -------------------------
+# CLIENTS in DB
+# -------------------------
+def next_client_id() -> str:
+    # 000001 increment
+    conn = db()
+    row = conn.execute("SELECT id FROM clients ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    if not row:
+        return "000001"
+    try:
+        n = int(row["id"])
+        return f"{n+1:06d}"
+    except Exception:
+        return f"{int(time.time())%1000000:06d}"
 
 def get_or_create_client_id_by_phone9(phone9: str) -> tuple[str, bool]:
     phone9 = normalize_phone_pt9(phone9)
     if not phone9:
         return "", False
-    idx = load_client_index()
-    existing_id = idx.get(phone9)
-    if existing_id:
-        return existing_id, True
 
-    cid = next_client_id(list_existing_client_ids())
-    idx[phone9] = cid
-    save_client_index(idx)
+    conn = db()
+    row = conn.execute("SELECT client_id FROM phone_index WHERE phone9=?", (phone9,)).fetchone()
+    if row:
+        cid = row["client_id"]
+        conn.close()
+        return cid, True
+
+    cid = next_client_id()
+    conn.execute("INSERT OR REPLACE INTO phone_index(phone9,client_id) VALUES(?,?)", (phone9, cid))
+    conn.commit()
+    conn.close()
     return cid, False
 
-def upsert_client_profile(client_id: str, phone9: str, name: str, email: str = "") -> tuple[dict, bool, str]:
+def db_get_client_by_id(cid: str) -> dict:
+    conn = db()
+    row = conn.execute("SELECT data FROM clients WHERE id=?", (cid,)).fetchone()
+    conn.close()
+    if not row:
+        return {}
+    try:
+        return json.loads(row["data"])
+    except Exception:
+        return {}
+
+def db_get_client_by_phone9(phone9: str) -> dict:
+    phone9 = normalize_phone_pt9(phone9)
+    conn = db()
+    row = conn.execute("SELECT data FROM clients WHERE phone9=?", (phone9,)).fetchone()
+    conn.close()
+    if not row:
+        return {}
+    try:
+        return json.loads(row["data"])
+    except Exception:
+        return {}
+
+def db_upsert_client_profile(cid: str, phone9: str, name: str, email: str = "") -> tuple[dict, bool, str]:
     phone9 = normalize_phone_pt9(phone9)
     if not phone9:
         return {}, False, "Telefone inválido"
@@ -243,36 +277,68 @@ def upsert_client_profile(client_id: str, phone9: str, name: str, email: str = "
         return {}, False, "Nome obrigatório"
     email = norm_email(email)
 
-    idx = load_client_index()
-    cur_id = idx.get(phone9)
-    if cur_id and cur_id != client_id:
+    # validar duplicado phone9
+    conn = db()
+    row = conn.execute("SELECT id FROM clients WHERE phone9=? AND id<>?", (phone9, cid)).fetchone()
+    if row:
+        conn.close()
         return {}, False, "Este telemóvel já existe noutro cliente"
 
-    idx[phone9] = client_id
-    save_client_index(idx)
-
-    cur = find_client_by_id(client_id)
+    cur = conn.execute("SELECT data FROM clients WHERE id=?", (cid,)).fetchone()
     created = not bool(cur)
 
-    client = cur or {"id": client_id, "nome": "", "telefone": "", "email": ""}
-    client["id"] = client_id
-    client["telefone"] = phone9
+    client = {}
+    if cur:
+        try:
+            client = json.loads(cur["data"])
+        except Exception:
+            client = {}
+
+    client["id"] = cid
     client["nome"] = name
+    client["telefone"] = phone9
     if email:
         client["email"] = email
+    else:
+        client["email"] = norm_email(client.get("email", ""))
 
-    write_cliente_txt(client)
-    return dict(client), created, ""
+    payload = dict(client)
 
-# =========================
-# BOOT STORAGE
-# =========================
-load_bookings()
+    conn.execute("""
+      INSERT OR REPLACE INTO clients(id, phone9, name, email, data, updated_at)
+      VALUES(?,?,?,?,?,?)
+    """, (cid, phone9, name, client.get("email",""), json.dumps(payload, ensure_ascii=False), int(time.time())))
 
-# ⚠️ CHANGES é só memória: reconstruímos a fila a partir dos BOOKINGS persistidos
-CHANGES.clear()
-for b in BOOKINGS.values():
-    push_change("upsert", b)
+    conn.execute("INSERT OR REPLACE INTO phone_index(phone9, client_id) VALUES(?,?)", (phone9, cid))
+    conn.commit()
+    conn.close()
+
+    push_client_change("upsert", {
+        "id": cid,
+        "name": name,
+        "phone": phone9,
+        "email": client.get("email",""),
+    })
+
+    return payload, created, ""
+
+def db_all_clients() -> list:
+    conn = db()
+    rows = conn.execute("SELECT data FROM clients").fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r["data"]))
+        except Exception:
+            pass
+    return out
+
+def db_clients_count() -> int:
+    conn = db()
+    row = conn.execute("SELECT COUNT(*) AS n FROM clients").fetchone()
+    conn.close()
+    return int(row["n"] or 0)
 
 # =========================
 # HOME / HEALTH
@@ -282,9 +348,10 @@ def home():
     return jsonify({
         "ok": True,
         "service": "barbearia-api",
-        "bookings": len(BOOKINGS),
-        "changes": len(CHANGES),
-        "data_dir": DATA_DIR
+        "bookings": db_bookings_count(),
+        "clients": db_clients_count(),
+        "data_dir": DATA_DIR,
+        "db_path": DB_PATH,
     })
 
 @app.get("/health")
@@ -301,20 +368,26 @@ def client_login():
     if not phone9:
         return bad("Telefone inválido (usa 9 dígitos PT)")
 
-    client_id, existing = get_or_create_client_id_by_phone9(phone9)
+    # se já existe perfil, devolve
+    existing_profile = db_get_client_by_phone9(phone9)
+    if existing_profile:
+        return jsonify({"ok": True, "existing": True, "client": existing_profile})
 
-    if existing:
-        c = find_client_by_id(client_id) or {"id": client_id, "nome": "", "telefone": phone9, "email": ""}
-        return jsonify({"ok": True, "existing": True, "client": c})
-
-    return jsonify({"ok": True, "existing": False, "client": {"id": client_id, "nome": "", "telefone": phone9, "email": ""}})
+    # se não existe perfil, devolve id (index) mas NÃO cria perfil
+    client_id, existing_index = get_or_create_client_id_by_phone9(phone9)
+    return jsonify({
+        "ok": True,
+        "existing": False,
+        "client": {"id": client_id, "nome": "", "telefone": phone9, "email": ""},
+        "has_index": bool(existing_index),
+    })
 
 @app.get("/client/<client_id>")
 def client_get(client_id):
     cid = norm_str(client_id)
     if not cid:
         return bad("id inválido")
-    c = find_client_by_id(cid)
+    c = db_get_client_by_id(cid)
     if not c:
         return bad("not found", 404)
     return jsonify({"ok": True, "client": c})
@@ -334,7 +407,7 @@ def client_upsert():
     if not name:
         return bad("name obrigatório")
 
-    client, created, err = upsert_client_profile(cid, phone9, name, email=email)
+    client, created, err = db_upsert_client_profile(cid, phone9, name, email=email)
     if err:
         return bad(err)
     return jsonify({"ok": True, "created": created, "client": client})
@@ -356,12 +429,12 @@ def book():
             return bad(f"Campo obrigatório em falta: {k}")
 
     cid = norm_str(data.get("client_id"))
-    c = find_client_by_id(cid)
+    c = db_get_client_by_id(cid)
     if not c or not norm_str(c.get("nome")):
         return bad("Cliente sem perfil. Cria primeiro (nome).")
 
     bid = norm_str(data.get("id")) or now_id()
-    t = norm_str(str(data["time"]))[:5]
+    t = norm_time_hhmm(data.get("time"))
 
     item = {
         "id": bid,
@@ -380,8 +453,7 @@ def book():
         "created_at": int(time.time()),
     }
 
-    BOOKINGS[bid] = item
-    save_bookings()
+    db_put_booking(item)
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid, "client_id": item["client_id"]})
 
@@ -390,7 +462,7 @@ def book():
 # =========================
 def _day_items_for_clients(date: str = "", barber: str = ""):
     out = []
-    for b in BOOKINGS.values():
+    for b in db_all_bookings():
         if date and b.get("date") != date:
             continue
         if barber and b.get("barber") != barber:
@@ -417,7 +489,7 @@ def day():
     return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
 # =========================
-# ✅ ADMIN ENDPOINTS (para o admin.html)
+# ✅ ADMIN ENDPOINTS
 # =========================
 @app.get("/admin/bookings")
 def admin_bookings():
@@ -428,7 +500,7 @@ def admin_bookings():
     barber = norm_str(request.args.get("barber", ""))
 
     items = []
-    for b in BOOKINGS.values():
+    for b in db_all_bookings():
         if date and b.get("date") != date:
             continue
         if barber and b.get("barber") != barber:
@@ -443,7 +515,7 @@ def admin_booking_get(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
     bid = norm_str(bid)
-    b = BOOKINGS.get(bid)
+    b = db_get_booking(bid)
     if not b:
         return bad("not found", 404)
     return jsonify({"ok": True, "item": b})
@@ -455,7 +527,7 @@ def admin_block():
 
     data = request.get_json(silent=True) or {}
     date = norm_str(data.get("date"))
-    time_s = norm_str(data.get("time"))[:5]
+    time_s = norm_time_hhmm(data.get("time"))
     barber = norm_str(data.get("barber"))
 
     if not date or not time_s or not barber:
@@ -478,8 +550,7 @@ def admin_block():
         "client": "",
         "created_at": int(time.time()),
     }
-    BOOKINGS[bid] = item
-    save_bookings()
+    db_put_booking(item)
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
@@ -489,13 +560,12 @@ def admin_unblock(bid):
         return bad("unauthorized", 401)
 
     bid = norm_str(bid)
-    b = BOOKINGS.get(bid)
+    b = db_get_booking(bid)
     if not b:
         return bad("not found", 404)
 
     b["status"] = "Desbloqueado"
-    BOOKINGS[bid] = b
-    save_bookings()
+    db_put_booking(b)
     push_change("upsert", b)
     return jsonify({"ok": True})
 
@@ -505,18 +575,17 @@ def admin_cancel(bid):
         return bad("unauthorized", 401)
 
     bid = norm_str(bid)
-    b = BOOKINGS.get(bid)
+    b = db_get_booking(bid)
     if not b:
         return bad("not found", 404)
 
     b["status"] = "Cancelado"
-    BOOKINGS[bid] = b
-    save_bookings()
+    db_put_booking(b)
     push_change("upsert", b)
     return jsonify({"ok": True})
 
 # =========================
-# ✅ BRIDGE ENDPOINTS
+# ✅ BRIDGE ENDPOINTS (BOOKINGS)
 # =========================
 @app.get("/pull")
 def bridge_pull():
@@ -532,31 +601,32 @@ def bridge_pull():
     except Exception:
         limit = 300
 
-    if cursor < 0:
-        cursor = 0
-    if limit < 1:
-        limit = 1
-    if limit > 2000:
-        limit = 2000
+    if cursor < 0: cursor = 0
+    if limit < 1: limit = 1
+    if limit > 2000: limit = 2000
 
-    changes = list(CHANGES)
+    conn = db()
+    rows = conn.execute(
+        "SELECT seq, op, payload, ts FROM changes WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+        (cursor, limit)
+    ).fetchall()
+    conn.close()
 
-    # ✅ FIX CRÍTICO:
-    # Se a API reiniciar, CHANGES "recomeça" e o cursor antigo do bridge pode ficar fora de range.
-    cursor_reset = False
-    if cursor > len(changes):
-        cursor = 0
-        cursor_reset = True
-
-    batch = changes[cursor: cursor + limit]
-    next_cursor = cursor + len(batch)
+    items = []
+    last_seq = cursor
+    for r in rows:
+        last_seq = int(r["seq"])
+        try:
+            payload = json.loads(r["payload"])
+        except Exception:
+            payload = {}
+        items.append({"op": r["op"], "payload": payload, "ts": int(r["ts"])})
 
     return jsonify({
         "ok": True,
-        "items": batch,
-        "cursor": next_cursor,
-        "changes_len": len(changes),
-        "cursor_reset": cursor_reset
+        "items": items,
+        "cursor": last_seq,   # cursor agora é seq
+        "cursor_reset": False
     })
 
 @app.post("/sync")
@@ -584,14 +654,13 @@ def bridge_sync():
             continue
 
         if op == "delete":
-            if bid in BOOKINGS:
-                BOOKINGS.pop(bid, None)
-                applied += 1
+            db_del_booking(bid)
             push_change("delete", {"id": bid})
+            applied += 1
             continue
 
         if op == "upsert":
-            cur = BOOKINGS.get(bid, {})
+            cur = db_get_booking(bid) or {}
             if not isinstance(cur, dict):
                 cur = {}
             cur.update(payload)
@@ -601,7 +670,7 @@ def bridge_sync():
             if cur.get("email"):
                 cur["email"] = norm_email(cur.get("email"))
             if cur.get("time"):
-                cur["time"] = norm_str(cur.get("time"))[:5]
+                cur["time"] = norm_time_hhmm(cur.get("time"))
             if cur.get("dur") is not None:
                 try:
                     cur["dur"] = int(float(cur.get("dur")))
@@ -610,12 +679,11 @@ def bridge_sync():
             if not cur.get("created_at"):
                 cur["created_at"] = int(time.time())
 
-            BOOKINGS[bid] = cur
+            db_put_booking(cur)
             push_change("upsert", cur)
             applied += 1
             continue
 
-    save_bookings()
     return jsonify({"ok": True, "applied": applied})
 
 @app.post("/replace_all")
@@ -628,8 +696,14 @@ def bridge_replace_all():
     if not isinstance(items, list):
         return bad("items deve ser lista")
 
-    BOOKINGS.clear()
+    # apagar tudo
+    conn = db()
+    conn.execute("DELETE FROM bookings")
+    conn.execute("DELETE FROM changes")
+    conn.commit()
+    conn.close()
 
+    count = 0
     for b in items:
         if not isinstance(b, dict):
             continue
@@ -642,7 +716,7 @@ def bridge_replace_all():
         if b.get("email"):
             b["email"] = norm_email(b.get("email"))
         if b.get("time"):
-            b["time"] = norm_str(b.get("time"))[:5]
+            b["time"] = norm_time_hhmm(b.get("time"))
         if b.get("dur") is not None:
             try:
                 b["dur"] = int(float(b.get("dur")))
@@ -651,18 +725,188 @@ def bridge_replace_all():
         if not b.get("created_at"):
             b["created_at"] = int(time.time())
 
-        BOOKINGS[bid] = b
-
-    save_bookings()
-
-    CHANGES.clear()
-    for b in BOOKINGS.values():
+        db_put_booking(b)
         push_change("upsert", b)
+        count += 1
 
-    return jsonify({"ok": True, "count": len(BOOKINGS)})
+    return jsonify({"ok": True, "count": count})
+
+# =========================
+# ✅ BRIDGE ENDPOINTS (CLIENTS)  <<<<< O QUE FALTAVA
+# =========================
+@app.get("/clients/all")
+def clients_all():
+    if not is_bridge(request):
+        return bad("unauthorized", 401)
+    # devolve lista simples para a bridge importar
+    out = []
+    for c in db_all_clients():
+        out.append({
+            "id": c.get("id",""),
+            "name": c.get("nome",""),
+            "phone": c.get("telefone",""),
+            "email": c.get("email",""),
+        })
+    return jsonify({"ok": True, "clients": out})
+
+@app.get("/clients/pull")
+def clients_pull():
+    if not is_bridge(request):
+        return bad("unauthorized", 401)
+
+    try:
+        cursor = int(request.args.get("cursor", "0") or "0")
+    except Exception:
+        cursor = 0
+    try:
+        limit = int(request.args.get("limit", "300") or "300")
+    except Exception:
+        limit = 300
+
+    if cursor < 0: cursor = 0
+    if limit < 1: limit = 1
+    if limit > 2000: limit = 2000
+
+    conn = db()
+    rows = conn.execute(
+        "SELECT seq, op, payload, ts FROM client_changes WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+        (cursor, limit)
+    ).fetchall()
+    conn.close()
+
+    items = []
+    last_seq = cursor
+    for r in rows:
+        last_seq = int(r["seq"])
+        try:
+            payload = json.loads(r["payload"])
+        except Exception:
+            payload = {}
+        items.append({"op": r["op"], "payload": payload, "ts": int(r["ts"])})
+
+    return jsonify({"ok": True, "items": items, "cursor": last_seq})
+
+@app.post("/clients/replace_all")
+def clients_replace_all():
+    if not is_bridge(request):
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    clients = data.get("clients") or []
+    if not isinstance(clients, list):
+        return bad("clients deve ser lista")
+
+    # apagar tudo (clients + indices + changes)
+    conn = db()
+    conn.execute("DELETE FROM clients")
+    conn.execute("DELETE FROM phone_index")
+    conn.execute("DELETE FROM client_changes")
+    conn.commit()
+    conn.close()
+
+    count = 0
+    for c in clients:
+        if not isinstance(c, dict):
+            continue
+        cid = norm_str(c.get("id"))
+        name = norm_str(c.get("name"))
+        phone9 = normalize_phone_pt9(c.get("phone"))
+        email = norm_email(c.get("email"))
+
+        if not cid:
+            continue
+        if phone9 and len(phone9) != 9:
+            phone9 = ""
+
+        payload = {"id": cid, "nome": name, "telefone": phone9, "email": email}
+
+        # grava
+        conn = db()
+        conn.execute("""
+          INSERT OR REPLACE INTO clients(id, phone9, name, email, data, updated_at)
+          VALUES(?,?,?,?,?,?)
+        """, (cid, phone9 or None, name, email, json.dumps(payload, ensure_ascii=False), int(time.time())))
+        if phone9:
+            conn.execute("INSERT OR REPLACE INTO phone_index(phone9, client_id) VALUES(?,?)", (phone9, cid))
+        conn.commit()
+        conn.close()
+
+        push_client_change("upsert", {"id": cid, "name": name, "phone": phone9, "email": email})
+        count += 1
+
+    return jsonify({"ok": True, "count": count})
+
+@app.post("/clients/sync")
+def clients_sync():
+    if not is_bridge(request):
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    changes = data.get("changes") or []
+    if not isinstance(changes, list):
+        return bad("changes deve ser lista")
+
+    applied = 0
+
+    for ev in changes:
+        if not isinstance(ev, dict):
+            continue
+        op = norm_str(ev.get("op"))
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        if op == "delete":
+            cid = norm_str(payload.get("id"))
+            if not cid:
+                continue
+            conn = db()
+            conn.execute("DELETE FROM clients WHERE id=?", (cid,))
+            conn.commit()
+            conn.close()
+            push_client_change("delete", {"id": cid})
+            applied += 1
+            continue
+
+        if op == "upsert":
+            cid = norm_str(payload.get("id"))
+            name = norm_str(payload.get("name") or payload.get("nome"))
+            phone9 = normalize_phone_pt9(payload.get("phone") or payload.get("telefone"))
+            email = norm_email(payload.get("email"))
+
+            if not cid:
+                continue
+
+            doc = {"id": cid, "nome": name, "telefone": phone9, "email": email}
+
+            conn = db()
+            # garantir unicidade do phone
+            if phone9:
+                row = conn.execute("SELECT id FROM clients WHERE phone9=? AND id<>?", (phone9, cid)).fetchone()
+                if row:
+                    # ignora para não corromper
+                    conn.close()
+                    continue
+
+            conn.execute("""
+              INSERT OR REPLACE INTO clients(id, phone9, name, email, data, updated_at)
+              VALUES(?,?,?,?,?,?)
+            """, (cid, phone9 or None, name, email, json.dumps(doc, ensure_ascii=False), int(time.time())))
+
+            if phone9:
+                conn.execute("INSERT OR REPLACE INTO phone_index(phone9, client_id) VALUES(?,?)", (phone9, cid))
+
+            conn.commit()
+            conn.close()
+
+            push_client_change("upsert", {"id": cid, "name": name, "phone": phone9, "email": email})
+            applied += 1
+
+    return jsonify({"ok": True, "applied": applied})
 
 # =========================
 # RUN
 # =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
