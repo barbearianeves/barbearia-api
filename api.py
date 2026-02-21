@@ -268,6 +268,8 @@ def upsert_client_profile(client_id: str, phone9: str, name: str, email: str = "
 # BOOT STORAGE
 # =========================
 load_bookings()
+
+# ⚠️ CHANGES é só memória: reconstruímos a fila a partir dos BOOKINGS persistidos
 CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
@@ -277,7 +279,13 @@ for b in BOOKINGS.values():
 # =========================
 @app.get("/")
 def home():
-    return jsonify({"ok": True, "service": "barbearia-api", "bookings": len(BOOKINGS), "data_dir": DATA_DIR})
+    return jsonify({
+        "ok": True,
+        "service": "barbearia-api",
+        "bookings": len(BOOKINGS),
+        "changes": len(CHANGES),
+        "data_dir": DATA_DIR
+    })
 
 @app.get("/health")
 def health():
@@ -299,7 +307,6 @@ def client_login():
         c = find_client_by_id(client_id) or {"id": client_id, "nome": "", "telefone": phone9, "email": ""}
         return jsonify({"ok": True, "existing": True, "client": c})
 
-    # novo
     return jsonify({"ok": True, "existing": False, "client": {"id": client_id, "nome": "", "telefone": phone9, "email": ""}})
 
 @app.get("/client/<client_id>")
@@ -533,10 +540,24 @@ def bridge_pull():
         limit = 2000
 
     changes = list(CHANGES)
+
+    # ✅ FIX CRÍTICO:
+    # Se a API reiniciar, CHANGES "recomeça" e o cursor antigo do bridge pode ficar fora de range.
+    cursor_reset = False
+    if cursor > len(changes):
+        cursor = 0
+        cursor_reset = True
+
     batch = changes[cursor: cursor + limit]
     next_cursor = cursor + len(batch)
 
-    return jsonify({"ok": True, "items": batch, "cursor": next_cursor})
+    return jsonify({
+        "ok": True,
+        "items": batch,
+        "cursor": next_cursor,
+        "changes_len": len(changes),
+        "cursor_reset": cursor_reset
+    })
 
 @app.post("/sync")
 def bridge_sync():
