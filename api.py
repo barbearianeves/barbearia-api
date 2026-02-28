@@ -36,12 +36,20 @@ CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
 # ✅ clientes (persistente) - mantém para fotos + admin
 CLIENTS = {}                     # client_id -> client dict
 
+
+# -------------------------
+# IDS
+# -------------------------
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
 
 def now_client_id():
     return "C-" + str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(2)
 
+
+# -------------------------
+# Helpers
+# -------------------------
 def bad(msg, code=400):
     return jsonify({"error": msg}), code
 
@@ -61,6 +69,7 @@ def norm_phone(p: str) -> str:
 
 def norm_email(e: str) -> str:
     return (e or "").strip().lower()
+
 
 # -------------------------
 # ✅ STORAGE: escolher diretório escrevível
@@ -149,6 +158,7 @@ CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
 
+
 # -------------------------
 # ✅ EMAIL: SMTP por IPv4 + logs
 # -------------------------
@@ -218,6 +228,7 @@ Barbearia
         print(f"[EMAIL] ERRO: {type(e).__name__}: {e}", flush=True)
         return False, f"{type(e).__name__}: {e}"
 
+
 # -------------------------
 # HOME / HEALTH
 # -------------------------
@@ -230,6 +241,8 @@ def home():
         "changes": len(CHANGES),
         "clients": len(CLIENTS),
         "persist": BOOKINGS_FILE or "NO_PERSIST",
+        "data_dir": DATA_DIR or "NO_DATA_DIR",
+        "uploads_dir": UPLOADS_DIR or "NO_UPLOADS",
         "bridge_pc_base": BRIDGE_PC_BASE or "",
         "smtp": {
             "from": FROM_EMAIL,
@@ -244,8 +257,27 @@ def home():
 def health():
     return jsonify({"ok": True})
 
+
 # -------------------------
-# ✅ servir uploads por URL
+# ✅ DEBUG: ver rotas (para matar o 404 fantasma)
+# -------------------------
+@app.get("/debug/routes")
+def debug_routes():
+    out = []
+    for r in app.url_map.iter_rules():
+        methods = sorted([m for m in r.methods if m not in ("HEAD", "OPTIONS")])
+        out.append({"rule": str(r), "methods": methods, "endpoint": r.endpoint})
+    out.sort(key=lambda x: x["rule"])
+    return jsonify({"ok": True, "routes": out})
+
+@app.get("/debug/client/<cid>")
+def debug_client(cid):
+    c = CLIENTS.get(cid)
+    return jsonify({"ok": True, "item": c or None})
+
+
+# -------------------------
+# ✅ servir uploads por URL (a bridge vai buscar daqui)
 # -------------------------
 @app.get("/files/<path:filepath>")
 def files(filepath):
@@ -254,8 +286,10 @@ def files(filepath):
     safe = filepath.replace("..", "").lstrip("/\\")
     return send_from_directory(UPLOADS_DIR, safe, as_attachment=False)
 
+
 # -------------------------
 # ✅ BRIDGE: CLIENTES (para bridge puxar URLs das fotos)
+# IMPORTANTE: devolve SEMPRE campos id + photo_before_url + photo_after_url
 # -------------------------
 @app.get("/bridge/clients")
 def bridge_clients():
@@ -263,9 +297,22 @@ def bridge_clients():
     if secret != BRIDGE_SECRET:
         return bad("unauthorized", 401)
 
-    items = list(CLIENTS.values())
+    items = []
+    for cid, c in CLIENTS.items():
+        # normalizar para a bridge
+        item = {
+            "id": (c.get("id") or cid),
+            "name": (c.get("name") or ""),
+            "phone": norm_phone(c.get("phone") or ""),
+            "email": norm_email(c.get("email") or ""),
+            "photo_before_url": (c.get("photo_before_url") or ""),
+            "photo_after_url": (c.get("photo_after_url") or ""),
+        }
+        items.append(item)
+
     items.sort(key=lambda x: (x.get("name",""), x.get("id","")))
     return jsonify({"ok": True, "items": items})
+
 
 # -------------------------
 # ✅ PUBLIC: clientes (SÓ os do PC)
@@ -292,6 +339,7 @@ def public_clients():
     except Exception as e:
         return bad(f"bridge pc offline: {type(e).__name__}: {e}", 502)
 
+
 # -------------------------
 # ✅ ADMIN: TESTE EMAIL
 # -------------------------
@@ -316,6 +364,7 @@ def admin_test_email():
 
     ok, msg = send_validation_email(fake_booking, subject="✅ Teste SMTP - Barbearia")
     return jsonify({"ok": ok, "message": msg})
+
 
 # -------------------------
 # CLIENTE: CRIAR MARCAÇÃO
@@ -374,6 +423,7 @@ def book():
         save_clients()
 
     return jsonify({"ok": True, "id": bid})
+
 
 # -------------------------
 # BRIDGE: PULL / SYNC
@@ -487,6 +537,7 @@ def replace_all():
 
     return jsonify({"ok": True, "count": len(BOOKINGS)})
 
+
 # -------------------------
 # CLIENTE: VER OCUPADOS/DIA
 # -------------------------
@@ -526,6 +577,7 @@ def busy():
     barber = request.args.get("barber", "")
     return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
+
 # ==========================
 # ADMIN: LISTAR BOOKINGS
 # ==========================
@@ -557,6 +609,7 @@ def admin_get_booking(bid):
         return bad("not found", 404)
     return jsonify({"ok": True, "item": b})
 
+
 # ==========================
 # ADMIN: CANCELAR
 # ==========================
@@ -572,6 +625,7 @@ def admin_cancel(bid):
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
+
 
 # ==========================
 # ADMIN: BLOQUEAR
@@ -612,6 +666,7 @@ def admin_block():
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
+
 # ==========================
 # ADMIN: DESBLOQUEAR
 # ==========================
@@ -627,6 +682,7 @@ def admin_unblock(bid):
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
+
 
 # ==========================
 # ✅ ADMIN: VALIDAR + EMAIL
@@ -658,6 +714,7 @@ def admin_validate_and_email(bid):
         "email_sent": ok,
         "message": msg_email
     })
+
 
 # ==========================
 # ✅ CLIENTES (ADMIN)
@@ -711,15 +768,20 @@ def admin_clients_upsert():
 
     c["updated_at"] = int(time.time())
 
-    if data.get("photo_before_url"):
-        c["photo_before_url"] = str(data["photo_before_url"]).strip()
-    if data.get("photo_after_url"):
-        c["photo_after_url"] = str(data["photo_after_url"]).strip()
+    # permitir set direto (opcional)
+    if data.get("photo_before_url") is not None:
+        c["photo_before_url"] = str(data.get("photo_before_url") or "").strip()
+    if data.get("photo_after_url") is not None:
+        c["photo_after_url"] = str(data.get("photo_after_url") or "").strip()
 
     CLIENTS[cid] = c
     save_clients()
     return jsonify({"ok": True, "id": cid, "item": c})
 
+
+# -------------------------
+# ✅ ADMIN: upload de foto (gera /files/<cid>/before-xxx.jpg)
+# -------------------------
 @app.post("/admin/client/<cid>/photo")
 def admin_client_upload_photo(cid):
     if not is_admin(request):
@@ -773,6 +835,7 @@ def admin_client_upload_photo(cid):
     save_clients()
 
     return jsonify({"ok": True, "url": url, "item": c})
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
