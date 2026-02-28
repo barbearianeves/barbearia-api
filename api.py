@@ -1,5 +1,4 @@
-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from collections import deque
 import os, time, secrets, json
@@ -28,8 +27,14 @@ SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
 
+# ✅ clientes (persistente)
+CLIENTS = {}                     # client_id -> client dict
+
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
+
+def now_client_id():
+    return "C-" + str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(2)
 
 def bad(msg, code=400):
     return jsonify({"error": msg}), code
@@ -39,6 +44,17 @@ def push_change(op, payload):
 
 def is_admin(req):
     return (req.headers.get("X-Admin-Token", "") or "").strip() == ADMIN_TOKEN
+
+def norm_phone(p: str) -> str:
+    p = (p or "").strip()
+    if not p: return ""
+    digits = "".join([c for c in p if c.isdigit()])
+    if len(digits) == 12 and digits.startswith("351"):
+        digits = digits[3:]
+    return digits
+
+def norm_email(e: str) -> str:
+    return (e or "").strip().lower()
 
 # -------------------------
 # ✅ STORAGE: escolher diretório escrevível
@@ -66,6 +82,12 @@ def pick_data_dir():
 
 DATA_DIR = pick_data_dir()
 BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
+CLIENTS_FILE  = os.path.join(DATA_DIR, "clients.json")  if DATA_DIR else None
+
+# ✅ pasta de uploads (fotos)
+UPLOADS_DIR = os.path.join(DATA_DIR, "uploads") if DATA_DIR else None
+if UPLOADS_DIR:
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 def load_bookings():
     global BOOKINGS
@@ -90,7 +112,31 @@ def save_bookings():
         json.dump(BOOKINGS, f, ensure_ascii=False)
     os.replace(tmp, BOOKINGS_FILE)
 
+def load_clients():
+    global CLIENTS
+    if not CLIENTS_FILE:
+        CLIENTS = {}
+        return
+    try:
+        if os.path.exists(CLIENTS_FILE):
+            with open(CLIENTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            CLIENTS = data if isinstance(data, dict) else {}
+        else:
+            CLIENTS = {}
+    except Exception:
+        CLIENTS = {}
+
+def save_clients():
+    if not CLIENTS_FILE:
+        return
+    tmp = CLIENTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(CLIENTS, f, ensure_ascii=False)
+    os.replace(tmp, CLIENTS_FILE)
+
 load_bookings()
+load_clients()
 
 # ✅ snapshot em memória (para bridge puxar após restart)
 CHANGES.clear()
@@ -101,10 +147,6 @@ for b in BOOKINGS.values():
 # ✅ EMAIL: SMTP por IPv4 + logs
 # -------------------------
 def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
-    """
-    Resolve host para IPv4 e liga por IPv4.
-    Ajuda em ambientes sem rota IPv6.
-    """
     ipv4 = None
     try:
         infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
@@ -150,7 +192,6 @@ Barbearia
         msg["Subject"] = subj
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        # ✅ Logs úteis no Render
         print(f"[EMAIL] to={to_email} host={SMTP_HOST} port={SMTP_PORT} user={SMTP_USER}", flush=True)
 
         server = smtp_connect_ipv4(SMTP_HOST, SMTP_PORT, timeout=20)
@@ -181,6 +222,7 @@ def home():
         "service": "barbearia-api",
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES),
+        "clients": len(CLIENTS),
         "persist": BOOKINGS_FILE or "NO_PERSIST",
         "smtp": {
             "from": FROM_EMAIL,
@@ -194,6 +236,17 @@ def home():
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
+
+# -------------------------
+# ✅ servir uploads por URL
+# -------------------------
+@app.get("/files/<path:filepath>")
+def files(filepath):
+    if not UPLOADS_DIR:
+        return bad("uploads disabled", 500)
+    # segurança básica: impede path traversal
+    safe = filepath.replace("..", "").lstrip("/\\")
+    return send_from_directory(UPLOADS_DIR, safe, as_attachment=False)
 
 # -------------------------
 # ✅ ADMIN: TESTE EMAIL (NÃO depende de booking)
@@ -234,11 +287,15 @@ def book():
     t = str(data["time"]).strip()[:5]
     bid = data.get("id") or now_id()
 
+    phone = norm_phone(str(data.get("phone", "")).strip())
+    email = norm_email(str(data.get("email", "")).strip())
+    client_id = str(data.get("client_id", "")).strip()
+
     item = {
         "id": bid,
         "name": str(data.get("name", "")).strip(),
-        "phone": str(data.get("phone", "")).strip(),
-        "email": str(data.get("email", "")).strip(),
+        "phone": phone,
+        "email": email,
         "service": str(data.get("service", "")).strip(),
         "barber": str(data.get("barber", "")).strip(),
         "date": str(data.get("date", "")).strip(),
@@ -246,7 +303,7 @@ def book():
         "dur": int(float(data.get("dur", 30))),
         "notes": str(data.get("notes", "")).strip(),
         "status": "Marcado",
-        "client_id": str(data.get("client_id", "")).strip(),
+        "client_id": client_id,
         "client": str(data.get("client", "")).strip(),
         "created_at": int(time.time())
     }
@@ -254,6 +311,24 @@ def book():
     BOOKINGS[bid] = item
     save_bookings()
     push_change("upsert", item)
+
+    # ✅ se vier client_id, garante que existe um cliente
+    if client_id:
+        c = CLIENTS.get(client_id) or {}
+        if not c.get("id"):
+            c["id"] = client_id
+        if item.get("name") and not c.get("name"):
+            c["name"] = item["name"]
+        if item.get("phone") and not c.get("phone"):
+            c["phone"] = item["phone"]
+        if item.get("email") and not c.get("email"):
+            c["email"] = item["email"]
+        c["updated_at"] = int(time.time())
+        if not c.get("created_at"):
+            c["created_at"] = int(time.time())
+        CLIENTS[client_id] = c
+        save_clients()
+
     return jsonify({"ok": True, "id": bid})
 
 # -------------------------
@@ -306,6 +381,22 @@ def sync():
             push_change("upsert", BOOKINGS[bid])
             applied += 1
 
+            # ✅ se bridge enviar client_id, mantém clientes em dia
+            cid = (BOOKINGS[bid].get("client_id") or "").strip()
+            if cid:
+                c = CLIENTS.get(cid) or {"id": cid}
+                if BOOKINGS[bid].get("name"):
+                    c["name"] = BOOKINGS[bid]["name"]
+                if BOOKINGS[bid].get("phone"):
+                    c["phone"] = BOOKINGS[bid]["phone"]
+                if BOOKINGS[bid].get("email"):
+                    c["email"] = BOOKINGS[bid]["email"]
+                c["updated_at"] = int(time.time())
+                if not c.get("created_at"):
+                    c["created_at"] = int(time.time())
+                CLIENTS[cid] = c
+                save_clients()
+
     return jsonify({"ok": True, "applied": applied})
 
 @app.post("/replace_all")
@@ -328,7 +419,23 @@ def replace_all():
             continue
         BOOKINGS[bid] = b
 
+        # ✅ alimentar clientes
+        cid = (b.get("client_id") or "").strip()
+        if cid:
+            c = CLIENTS.get(cid) or {"id": cid}
+            if b.get("name"):
+                c["name"] = b.get("name")
+            if b.get("phone"):
+                c["phone"] = norm_phone(b.get("phone"))
+            if b.get("email"):
+                c["email"] = norm_email(b.get("email"))
+            c["updated_at"] = int(time.time())
+            if not c.get("created_at"):
+                c["created_at"] = int(time.time())
+            CLIENTS[cid] = c
+
     save_bookings()
+    save_clients()
 
     CHANGES.clear()
     for b in BOOKINGS.values():
@@ -376,7 +483,7 @@ def busy():
     return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
 # ==========================
-# ADMIN: LISTAR
+# ADMIN: LISTAR BOOKINGS
 # ==========================
 @app.get("/admin/bookings")
 def admin_list():
@@ -396,6 +503,16 @@ def admin_list():
 
     out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
     return jsonify({"ok": True, "items": out})
+
+# ✅ FALTAVA: admin/booking/<id> (o teu admin chama isto)
+@app.get("/admin/booking/<bid>")
+def admin_get_booking(bid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+    b = BOOKINGS.get(bid)
+    if not b:
+        return bad("not found", 404)
+    return jsonify({"ok": True, "item": b})
 
 # ==========================
 # ADMIN: CANCELAR
@@ -482,7 +599,6 @@ def admin_validate_and_email(bid):
     data = request.get_json(silent=True) or {}
     new_status = (data.get("status") or "Chegou").strip()
 
-    # (Opcional) permitir definir email aqui:
     incoming_email = (data.get("email") or "").strip()
     if incoming_email:
         BOOKINGS[bid]["email"] = incoming_email
@@ -499,6 +615,158 @@ def admin_validate_and_email(bid):
         "email_sent": ok,
         "message": msg_email
     })
+
+# ==========================
+# ✅ CLIENTES (ADMIN)
+# ==========================
+@app.get("/admin/clients")
+def admin_clients_list():
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    q = (request.args.get("q") or "").strip().lower()
+
+    items = list(CLIENTS.values())
+    # fallback: se não houver clients, cria a partir dos bookings (para não ficar vazio)
+    if not items:
+        tmp = {}
+        for b in BOOKINGS.values():
+            cid = (b.get("client_id") or "").strip()
+            name = (b.get("name") or "").strip()
+            phone = norm_phone(b.get("phone") or "")
+            email = norm_email(b.get("email") or "")
+            if not cid:
+                # cria id determinístico pela combinação (simples)
+                if phone:
+                    cid = "T-" + phone
+                elif email:
+                    cid = "E-" + email.replace("@", "_at_")
+                else:
+                    continue
+            c = tmp.get(cid) or {"id": cid}
+            if name and not c.get("name"):
+                c["name"] = name
+            if phone and not c.get("phone"):
+                c["phone"] = phone
+            if email and not c.get("email"):
+                c["email"] = email
+            tmp[cid] = c
+        items = list(tmp.values())
+
+    if q:
+        def hit(c):
+            return (q in (c.get("id","").lower())
+                or q in (c.get("name","").lower())
+                or q in (c.get("phone","").lower())
+                or q in (c.get("email","").lower()))
+        items = [c for c in items if hit(c)]
+
+    items.sort(key=lambda x: (x.get("name",""), x.get("phone",""), x.get("id","")))
+    return jsonify({"ok": True, "items": items})
+
+@app.get("/admin/client/<cid>")
+def admin_client_get(cid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+    c = CLIENTS.get(cid)
+    if not c:
+        return bad("not found", 404)
+    return jsonify({"ok": True, "item": c})
+
+@app.post("/admin/clients")
+def admin_clients_upsert():
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    cid = (data.get("id") or "").strip() or now_client_id()
+
+    c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
+    name  = (data.get("name") or "").strip()
+    phone = norm_phone(data.get("phone") or "")
+    email = norm_email(data.get("email") or "")
+
+    if name:  c["name"] = name
+    if phone: c["phone"] = phone
+    if email: c["email"] = email
+    if "notes" in data and str(data.get("notes") or "").strip():
+        c["notes"] = str(data.get("notes") or "").strip()
+
+    c["updated_at"] = int(time.time())
+
+    # fotos (urls)
+    if data.get("photo_before_url"):
+        c["photo_before_url"] = str(data["photo_before_url"]).strip()
+    if data.get("photo_after_url"):
+        c["photo_after_url"] = str(data["photo_after_url"]).strip()
+
+    CLIENTS[cid] = c
+    save_clients()
+    return jsonify({"ok": True, "id": cid, "item": c})
+
+# --------------------------
+# ✅ UPLOAD de foto (antes/depois)
+# multipart/form-data:
+# - file: imagem
+# - kind: before | after
+# - note (opcional)
+# --------------------------
+@app.post("/admin/client/<cid>/photo")
+def admin_client_upload_photo(cid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    if not UPLOADS_DIR:
+        return bad("uploads disabled", 500)
+
+    kind = (request.form.get("kind") or "before").strip().lower()
+    if kind not in ["before", "after"]:
+        return bad("kind inválido (before|after)")
+
+    if "file" not in request.files:
+        return bad("Falta ficheiro: file")
+
+    f = request.files["file"]
+    if not f or not f.filename:
+        return bad("Ficheiro inválido")
+
+    # garantir cliente existe
+    c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
+
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]:
+        # não bloqueio forte, mas meto default
+        ext = ".jpg"
+
+    # guarda em /uploads/<cid>/<kind>-<ts>.ext
+    client_dir = os.path.join(UPLOADS_DIR, cid)
+    os.makedirs(client_dir, exist_ok=True)
+
+    ts = str(int(time.time()))
+    filename = f"{kind}-{ts}{ext}"
+    save_path = os.path.join(client_dir, filename)
+    f.save(save_path)
+
+    url_path = f"{cid}/{filename}"
+    url = f"/files/{url_path}"
+
+    if kind == "before":
+        c["photo_before_url"] = url
+        c["photo_before_at"] = int(time.time())
+    else:
+        c["photo_after_url"] = url
+        c["photo_after_at"] = int(time.time())
+
+    note = (request.form.get("note") or "").strip()
+    if note:
+        c.setdefault("photo_notes", [])
+        c["photo_notes"].append({"kind": kind, "note": note, "ts": int(time.time())})
+
+    c["updated_at"] = int(time.time())
+    CLIENTS[cid] = c
+    save_clients()
+
+    return jsonify({"ok": True, "url": url, "item": c})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
