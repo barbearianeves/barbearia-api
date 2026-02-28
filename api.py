@@ -18,7 +18,10 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # CONFIG / SECRETS
 # =========================
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345").strip()
-ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "neves-12345").strip()
+
+# ✅ IMPORTANTE: Admin token NÃO deve ser igual ao BRIDGE_SECRET
+# (mas se quiseres manter igual, mete no Render env ADMIN_TOKEN=neves-12345)
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "barbeiro-2026").strip()
 
 # ✅ Onde está o bridge HTTP no PC (para listar clientes reais da app C)
 BRIDGE_PC_BASE = (os.environ.get("BRIDGE_PC_BASE", "") or "").strip().rstrip("/")
@@ -69,6 +72,19 @@ def norm_phone(p: str) -> str:
 
 def norm_email(e: str) -> str:
     return (e or "").strip().lower()
+
+def abs_url(u: str) -> str:
+    """Transforma /files/... em URL absoluta com base no host atual."""
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    # base do request (Render)
+    base = request.host_url.rstrip("/")
+    if u.startswith("/"):
+        return base + u
+    return base + "/" + u
 
 
 # -------------------------
@@ -259,7 +275,7 @@ def health():
 
 
 # -------------------------
-# ✅ DEBUG: ver rotas (para matar o 404 fantasma)
+# ✅ DEBUG: ver rotas (mata o 404 fantasma)
 # -------------------------
 @app.get("/debug/routes")
 def debug_routes():
@@ -289,7 +305,7 @@ def files(filepath):
 
 # -------------------------
 # ✅ BRIDGE: CLIENTES (para bridge puxar URLs das fotos)
-# IMPORTANTE: devolve SEMPRE campos id + photo_before_url + photo_after_url
+# devolve SEMPRE id + photo_before_url + photo_after_url (ABSOLUTOS)
 # -------------------------
 @app.get("/bridge/clients")
 def bridge_clients():
@@ -299,14 +315,17 @@ def bridge_clients():
 
     items = []
     for cid, c in CLIENTS.items():
-        # normalizar para a bridge
+        before_u = (c.get("photo_before_url") or "").strip()
+        after_u  = (c.get("photo_after_url") or "").strip()
+
         item = {
             "id": (c.get("id") or cid),
             "name": (c.get("name") or ""),
             "phone": norm_phone(c.get("phone") or ""),
             "email": norm_email(c.get("email") or ""),
-            "photo_before_url": (c.get("photo_before_url") or ""),
-            "photo_after_url": (c.get("photo_after_url") or ""),
+            # ✅ aqui vai ABSOLUTO para a bridge não falhar
+            "photo_before_url": abs_url(before_u) if before_u else "",
+            "photo_after_url": abs_url(after_u) if after_u else "",
         }
         items.append(item)
 
@@ -316,7 +335,6 @@ def bridge_clients():
 
 # -------------------------
 # ✅ PUBLIC: clientes (SÓ os do PC)
-# a web do barbeiro deve usar isto p/ listar clientes
 # -------------------------
 @app.get("/public/clients")
 def public_clients():
