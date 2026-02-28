@@ -77,17 +77,37 @@ def norm_phone(p: str) -> str:
 def norm_email(e: str) -> str:
     return (e or "").strip().lower()
 
+def _guess_base_url():
+    """
+    Se não houver request context (ex: chamadas internas), tenta usar RENDER_EXTERNAL_URL.
+    """
+    base = (os.environ.get("RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
+    if base:
+        return base
+    # fallback: nada garantido
+    return ""
+
 def abs_url(u: str) -> str:
     """
     Transforma /files/... em URL absoluta com base no host atual.
-    Isto evita problemas na bridge ao descarregar fotos.
+    Se não houver request context, usa RENDER_EXTERNAL_URL (se existir).
     """
     u = (u or "").strip()
     if not u:
         return ""
     if u.startswith("http://") or u.startswith("https://"):
         return u
-    base = request.host_url.rstrip("/")
+
+    # request context?
+    try:
+        base = request.host_url.rstrip("/")
+    except Exception:
+        base = _guess_base_url()
+
+    if not base:
+        # último fallback: devolve como veio (para não crashar)
+        return u
+
     if u.startswith("/"):
         return base + u
     return base + "/" + u
@@ -252,9 +272,17 @@ Barbearia
 # -------------------------
 @app.get("/")
 def home():
+    # Ajuda a perceber se ESTE código está deployed
+    try:
+        rules_count = len(list(app.url_map.iter_rules()))
+    except Exception:
+        rules_count = -1
+
     return jsonify({
         "ok": True,
         "service": "barbearia-api",
+        "app_file": __file__,
+        "routes_count": rules_count,
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES),
         "clients": len(CLIENTS),
@@ -262,6 +290,7 @@ def home():
         "data_dir": DATA_DIR or "NO_DATA_DIR",
         "uploads_dir": UPLOADS_DIR or "NO_UPLOADS",
         "bridge_pc_base": BRIDGE_PC_BASE or "",
+        "render_external_url": (os.environ.get("RENDER_EXTERNAL_URL","") or ""),
         "smtp": {
             "from": FROM_EMAIL,
             "host": SMTP_HOST,
