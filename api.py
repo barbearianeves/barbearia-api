@@ -1,3 +1,11 @@
+# api.py — Barbearia API (bookings + clientes + fotos)
+# - /bridge/clients -> bridge no PC puxa URLs ABSOLUTOS das fotos
+# - /files/<path>   -> serve uploads (fotos) por URL
+# - /debug/routes   -> lista rotas (para matar "404 fantasma")
+#
+# Start (Render):
+#   gunicorn -w 1 api:app --bind 0.0.0.0:$PORT
+
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from collections import deque
@@ -17,11 +25,10 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # =========================
 # CONFIG / SECRETS
 # =========================
-BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345").strip()
+BRIDGE_SECRET = (os.environ.get("BRIDGE_SECRET", "neves-12345") or "").strip()
 
-# ✅ IMPORTANTE: Admin token NÃO deve ser igual ao BRIDGE_SECRET
-# (mas se quiseres manter igual, mete no Render env ADMIN_TOKEN=neves-12345)
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "neves-12345").strip()
+# ✅ ADMIN_TOKEN não deve ser igual ao BRIDGE_SECRET (mas podes manter igual via env)
+ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN", "neves-12345") or "").strip()
 
 # ✅ Onde está o bridge HTTP no PC (para listar clientes reais da app C)
 BRIDGE_PC_BASE = (os.environ.get("BRIDGE_PC_BASE", "") or "").strip().rstrip("/")
@@ -29,16 +36,13 @@ BRIDGE_PC_BASE = (os.environ.get("BRIDGE_PC_BASE", "") or "").strip().rstrip("/"
 # ✅ Email (Render envs)
 FROM_EMAIL = (os.environ.get("FROM_EMAIL", "") or "").strip() or (os.environ.get("SMTP_USER", "") or "").strip()
 SMTP_HOST  = (os.environ.get("SMTP_HOST", "smtp.gmail.com") or "").strip()
-SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587") or "587")
+SMTP_PORT  = int((os.environ.get("SMTP_PORT", "587") or "587").strip())
 SMTP_USER  = (os.environ.get("SMTP_USER", "") or "").strip() or FROM_EMAIL
 SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
-
-# ✅ clientes (persistente) - mantém para fotos + admin
-CLIENTS = {}                     # client_id -> client dict
-
+CLIENTS  = {}                    # client_id -> client dict (persistente)
 
 # -------------------------
 # IDS
@@ -48,7 +52,6 @@ def now_id():
 
 def now_client_id():
     return "C-" + str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(2)
-
 
 # -------------------------
 # Helpers
@@ -64,7 +67,8 @@ def is_admin(req):
 
 def norm_phone(p: str) -> str:
     p = (p or "").strip()
-    if not p: return ""
+    if not p:
+        return ""
     digits = "".join([c for c in p if c.isdigit()])
     if len(digits) == 12 and digits.startswith("351"):
         digits = digits[3:]
@@ -74,21 +78,22 @@ def norm_email(e: str) -> str:
     return (e or "").strip().lower()
 
 def abs_url(u: str) -> str:
-    """Transforma /files/... em URL absoluta com base no host atual."""
+    """
+    Transforma /files/... em URL absoluta com base no host atual.
+    Isto evita problemas na bridge ao descarregar fotos.
+    """
     u = (u or "").strip()
     if not u:
         return ""
     if u.startswith("http://") or u.startswith("https://"):
         return u
-    # base do request (Render)
     base = request.host_url.rstrip("/")
     if u.startswith("/"):
         return base + u
     return base + "/" + u
 
-
 # -------------------------
-# ✅ STORAGE: escolher diretório escrevível
+# STORAGE: escolher diretório escrevível
 # -------------------------
 def pick_data_dir():
     cand = (os.environ.get("DATA_DIR", "") or "").strip()
@@ -115,7 +120,6 @@ DATA_DIR = pick_data_dir()
 BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
 CLIENTS_FILE  = os.path.join(DATA_DIR, "clients.json")  if DATA_DIR else None
 
-# ✅ pasta de uploads (fotos)
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads") if DATA_DIR else None
 if UPLOADS_DIR:
     os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -169,14 +173,13 @@ def save_clients():
 load_bookings()
 load_clients()
 
-# ✅ snapshot em memória (para bridge puxar após restart)
+# snapshot em memória (para bridge puxar após restart)
 CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
 
-
 # -------------------------
-# ✅ EMAIL: SMTP por IPv4 + logs
+# EMAIL: SMTP por IPv4 + logs
 # -------------------------
 def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
     ipv4 = None
@@ -244,7 +247,6 @@ Barbearia
         print(f"[EMAIL] ERRO: {type(e).__name__}: {e}", flush=True)
         return False, f"{type(e).__name__}: {e}"
 
-
 # -------------------------
 # HOME / HEALTH
 # -------------------------
@@ -265,7 +267,7 @@ def home():
             "host": SMTP_HOST,
             "port": SMTP_PORT,
             "user_set": bool(SMTP_USER),
-            "pass_set": bool(SMTP_PASS)
+            "pass_set": bool(SMTP_PASS),
         }
     })
 
@@ -273,9 +275,8 @@ def home():
 def health():
     return jsonify({"ok": True})
 
-
 # -------------------------
-# ✅ DEBUG: ver rotas (mata o 404 fantasma)
+# DEBUG: ver rotas
 # -------------------------
 @app.get("/debug/routes")
 def debug_routes():
@@ -291,9 +292,8 @@ def debug_client(cid):
     c = CLIENTS.get(cid)
     return jsonify({"ok": True, "item": c or None})
 
-
 # -------------------------
-# ✅ servir uploads por URL (a bridge vai buscar daqui)
+# servir uploads por URL
 # -------------------------
 @app.get("/files/<path:filepath>")
 def files(filepath):
@@ -302,10 +302,8 @@ def files(filepath):
     safe = filepath.replace("..", "").lstrip("/\\")
     return send_from_directory(UPLOADS_DIR, safe, as_attachment=False)
 
-
 # -------------------------
-# ✅ BRIDGE: CLIENTES (para bridge puxar URLs das fotos)
-# devolve SEMPRE id + photo_before_url + photo_after_url (ABSOLUTOS)
+# BRIDGE: CLIENTES (URLs ABSOLUTOS)
 # -------------------------
 @app.get("/bridge/clients")
 def bridge_clients():
@@ -318,23 +316,20 @@ def bridge_clients():
         before_u = (c.get("photo_before_url") or "").strip()
         after_u  = (c.get("photo_after_url") or "").strip()
 
-        item = {
+        items.append({
             "id": (c.get("id") or cid),
             "name": (c.get("name") or ""),
             "phone": norm_phone(c.get("phone") or ""),
             "email": norm_email(c.get("email") or ""),
-            # ✅ aqui vai ABSOLUTO para a bridge não falhar
             "photo_before_url": abs_url(before_u) if before_u else "",
             "photo_after_url": abs_url(after_u) if after_u else "",
-        }
-        items.append(item)
+        })
 
     items.sort(key=lambda x: (x.get("name",""), x.get("id","")))
     return jsonify({"ok": True, "items": items})
 
-
 # -------------------------
-# ✅ PUBLIC: clientes (SÓ os do PC)
+# PUBLIC: clientes (SÓ os do PC via BRIDGE_PC_BASE)
 # -------------------------
 @app.get("/public/clients")
 def public_clients():
@@ -357,9 +352,8 @@ def public_clients():
     except Exception as e:
         return bad(f"bridge pc offline: {type(e).__name__}: {e}", 502)
 
-
 # -------------------------
-# ✅ ADMIN: TESTE EMAIL
+# ADMIN: TESTE EMAIL
 # -------------------------
 @app.post("/admin/test_email")
 def admin_test_email():
@@ -382,7 +376,6 @@ def admin_test_email():
 
     ok, msg = send_validation_email(fake_booking, subject="✅ Teste SMTP - Barbearia")
     return jsonify({"ok": ok, "message": msg})
-
 
 # -------------------------
 # CLIENTE: CRIAR MARCAÇÃO
@@ -416,35 +409,30 @@ def book():
         "status": "Marcado",
         "client_id": client_id,
         "client": str(data.get("client", "")).strip(),
-        "created_at": int(time.time())
+        "created_at": int(time.time()),
     }
 
     BOOKINGS[bid] = item
     save_bookings()
     push_change("upsert", item)
 
-    # ✅ se vier client_id, garante que existe um cliente
+    # garante cliente básico
     if client_id:
-        c = CLIENTS.get(client_id) or {}
-        if not c.get("id"):
-            c["id"] = client_id
-        if item.get("name") and not c.get("name"):
-            c["name"] = item["name"]
-        if item.get("phone") and not c.get("phone"):
-            c["phone"] = item["phone"]
-        if item.get("email") and not c.get("email"):
-            c["email"] = item["email"]
+        c = CLIENTS.get(client_id) or {"id": client_id, "created_at": int(time.time())}
+        if item.get("name"):
+            c.setdefault("name", item["name"])
+        if item.get("phone"):
+            c.setdefault("phone", item["phone"])
+        if item.get("email"):
+            c.setdefault("email", item["email"])
         c["updated_at"] = int(time.time())
-        if not c.get("created_at"):
-            c["created_at"] = int(time.time())
         CLIENTS[client_id] = c
         save_clients()
 
     return jsonify({"ok": True, "id": bid})
 
-
 # -------------------------
-# BRIDGE: PULL / SYNC
+# BRIDGE: PULL / SYNC / REPLACE_ALL
 # -------------------------
 @app.get("/pull")
 def pull():
@@ -493,10 +481,9 @@ def sync():
             push_change("upsert", BOOKINGS[bid])
             applied += 1
 
-            # ✅ se bridge enviar client_id, mantém clientes em dia
             cid = (BOOKINGS[bid].get("client_id") or "").strip()
             if cid:
-                c = CLIENTS.get(cid) or {"id": cid}
+                c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
                 if BOOKINGS[bid].get("name"):
                     c["name"] = BOOKINGS[bid]["name"]
                 if BOOKINGS[bid].get("phone"):
@@ -504,8 +491,6 @@ def sync():
                 if BOOKINGS[bid].get("email"):
                     c["email"] = norm_email(BOOKINGS[bid]["email"])
                 c["updated_at"] = int(time.time())
-                if not c.get("created_at"):
-                    c["created_at"] = int(time.time())
                 CLIENTS[cid] = c
                 save_clients()
 
@@ -531,10 +516,9 @@ def replace_all():
             continue
         BOOKINGS[bid] = b
 
-        # ✅ alimentar clientes
         cid = (b.get("client_id") or "").strip()
         if cid:
-            c = CLIENTS.get(cid) or {"id": cid}
+            c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
             if b.get("name"):
                 c["name"] = b.get("name")
             if b.get("phone"):
@@ -542,8 +526,6 @@ def replace_all():
             if b.get("email"):
                 c["email"] = norm_email(b.get("email"))
             c["updated_at"] = int(time.time())
-            if not c.get("created_at"):
-                c["created_at"] = int(time.time())
             CLIENTS[cid] = c
 
     save_bookings()
@@ -554,7 +536,6 @@ def replace_all():
         push_change("upsert", b)
 
     return jsonify({"ok": True, "count": len(BOOKINGS)})
-
 
 # -------------------------
 # CLIENTE: VER OCUPADOS/DIA
@@ -579,7 +560,7 @@ def _day_items_for_clients(date: str = "", barber: str = ""):
             "status": st,
             "label": "INDISPONÍVEL" if is_block else "OCUPADO",
             "service": b.get("service", ""),
-            "notes": b.get("notes", "")
+            "notes": b.get("notes", ""),
         })
     return out
 
@@ -595,10 +576,9 @@ def busy():
     barber = request.args.get("barber", "")
     return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
 
-
-# ==========================
+# -------------------------
 # ADMIN: LISTAR BOOKINGS
-# ==========================
+# -------------------------
 @app.get("/admin/bookings")
 def admin_list():
     if not is_admin(request):
@@ -627,27 +607,20 @@ def admin_get_booking(bid):
         return bad("not found", 404)
     return jsonify({"ok": True, "item": b})
 
-
-# ==========================
-# ADMIN: CANCELAR
-# ==========================
+# -------------------------
+# ADMIN: CANCELAR / BLOQUEAR / DESBLOQUEAR
+# -------------------------
 @app.post("/admin/cancel/<bid>")
 def admin_cancel(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-
     if bid not in BOOKINGS:
         return bad("not found", 404)
-
     BOOKINGS[bid]["status"] = "Cancelado"
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
-
-# ==========================
-# ADMIN: BLOQUEAR
-# ==========================
 @app.post("/admin/block")
 def admin_block():
     if not is_admin(request):
@@ -676,7 +649,7 @@ def admin_block():
         "status": "Bloqueado",
         "client_id": "",
         "client": "INDISPONÍVEL",
-        "created_at": int(time.time())
+        "created_at": int(time.time()),
     }
 
     BOOKINGS[bid] = item
@@ -684,32 +657,24 @@ def admin_block():
     push_change("upsert", item)
     return jsonify({"ok": True, "id": bid})
 
-
-# ==========================
-# ADMIN: DESBLOQUEAR
-# ==========================
 @app.post("/admin/unblock/<bid>")
 def admin_unblock(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-
     if bid not in BOOKINGS:
         return bad("not found", 404)
-
     BOOKINGS[bid]["status"] = "Desbloqueado"
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
-
-# ==========================
-# ✅ ADMIN: VALIDAR + EMAIL
-# ==========================
+# -------------------------
+# ADMIN: VALIDAR + EMAIL
+# -------------------------
 @app.post("/admin/validate_and_email/<bid>")
 def admin_validate_and_email(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-
     if bid not in BOOKINGS:
         return bad("not found", 404)
 
@@ -730,13 +695,12 @@ def admin_validate_and_email(bid):
         "ok": True,
         "status": new_status,
         "email_sent": ok,
-        "message": msg_email
+        "message": msg_email,
     })
 
-
-# ==========================
-# ✅ CLIENTES (ADMIN)
-# ==========================
+# -------------------------
+# ADMIN: CLIENTES (CRUD + upload foto)
+# -------------------------
 @app.get("/admin/clients")
 def admin_clients_list():
     if not is_admin(request):
@@ -748,9 +712,9 @@ def admin_clients_list():
     if q:
         def hit(c):
             return (q in (c.get("id","").lower())
-                or q in (c.get("name","").lower())
-                or q in (c.get("phone","").lower())
-                or q in (c.get("email","").lower()))
+                    or q in (c.get("name","").lower())
+                    or q in (c.get("phone","").lower())
+                    or q in (c.get("email","").lower()))
         items = [c for c in items if hit(c)]
 
     items.sort(key=lambda x: (x.get("name",""), x.get("phone",""), x.get("id","")))
@@ -786,7 +750,6 @@ def admin_clients_upsert():
 
     c["updated_at"] = int(time.time())
 
-    # permitir set direto (opcional)
     if data.get("photo_before_url") is not None:
         c["photo_before_url"] = str(data.get("photo_before_url") or "").strip()
     if data.get("photo_after_url") is not None:
@@ -796,10 +759,6 @@ def admin_clients_upsert():
     save_clients()
     return jsonify({"ok": True, "id": cid, "item": c})
 
-
-# -------------------------
-# ✅ ADMIN: upload de foto (gera /files/<cid>/before-xxx.jpg)
-# -------------------------
 @app.post("/admin/client/<cid>/photo")
 def admin_client_upload_photo(cid):
     if not is_admin(request):
@@ -833,8 +792,7 @@ def admin_client_upload_photo(cid):
     save_path = os.path.join(client_dir, filename)
     f.save(save_path)
 
-    url_path = f"{cid}/{filename}"
-    url = f"/files/{url_path}"
+    url = f"/files/{cid}/{filename}"
 
     if kind == "before":
         c["photo_before_url"] = url
@@ -853,7 +811,6 @@ def admin_client_upload_photo(cid):
     save_clients()
 
     return jsonify({"ok": True, "url": url, "item": c})
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
