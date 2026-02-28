@@ -21,7 +21,7 @@ BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "neves-12345").strip()
 
 # ✅ IMPORTANTE: Admin token NÃO deve ser igual ao BRIDGE_SECRET
 # (mas se quiseres manter igual, mete no Render env ADMIN_TOKEN=neves-12345)
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "barbeiro-2026").strip()
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "neves-12345").strip()
 
 # ✅ Onde está o bridge HTTP no PC (para listar clientes reais da app C)
 BRIDGE_PC_BASE = (os.environ.get("BRIDGE_PC_BASE", "") or "").strip().rstrip("/")
