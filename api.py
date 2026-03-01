@@ -9,7 +9,7 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from collections import deque
-import os, time, secrets, json
+import os, time, secrets, json, shutil
 
 # ✅ email
 import smtplib, ssl, socket
@@ -407,8 +407,21 @@ def admin_test_email():
     return jsonify({"ok": ok, "message": msg})
 
 # -------------------------
-# CLIENTE: CRIAR MARCAÇÃO
+# CLIENTE: CRIAR MARCAÇÃO (✅ cria cliente na 1ª marcação)
 # -------------------------
+def _find_client_id_by_email_or_phone(email: str, phone: str) -> str:
+    e = norm_email(email or "")
+    p = norm_phone(phone or "")
+    if e:
+        for cid, c in CLIENTS.items():
+            if norm_email(c.get("email") or "") == e:
+                return cid
+    if p:
+        for cid, c in CLIENTS.items():
+            if norm_phone(c.get("phone") or "") == p:
+                return cid
+    return ""
+
 @app.post("/book")
 def book():
     data = request.get_json(silent=True) or {}
@@ -420,13 +433,46 @@ def book():
     t = str(data["time"]).strip()[:5]
     bid = data.get("id") or now_id()
 
+    name = str(data.get("name", "")).strip()
     phone = norm_phone(str(data.get("phone", "")).strip())
     email = norm_email(str(data.get("email", "")).strip())
+
     client_id = str(data.get("client_id", "")).strip()
+
+    # ✅ se não vier client_id, dedupe/cria automaticamente
+    if not client_id:
+        hit = _find_client_id_by_email_or_phone(email, phone)
+        if hit:
+            client_id = hit
+        else:
+            client_id = now_client_id()
+            CLIENTS[client_id] = {
+                "id": client_id,
+                "name": name,
+                "phone": phone,
+                "email": email,
+                "notes": "",
+                "created_at": int(time.time()),
+                "updated_at": int(time.time()),
+            }
+            save_clients()
+
+    # ✅ garante que o cliente existe e atualiza básicos
+    if client_id:
+        c = CLIENTS.get(client_id) or {"id": client_id, "created_at": int(time.time())}
+        if name:
+            c.setdefault("name", name)
+        if phone:
+            c.setdefault("phone", phone)
+        if email:
+            c.setdefault("email", email)
+        c["updated_at"] = int(time.time())
+        CLIENTS[client_id] = c
+        save_clients()
 
     item = {
         "id": bid,
-        "name": str(data.get("name", "")).strip(),
+        "name": name,
         "phone": phone,
         "email": email,
         "service": str(data.get("service", "")).strip(),
@@ -436,7 +482,7 @@ def book():
         "dur": int(float(data.get("dur", 30))),
         "notes": str(data.get("notes", "")).strip(),
         "status": "Marcado",
-        "client_id": client_id,
+        "client_id": client_id,  # ✅ sempre preenchido
         "client": str(data.get("client", "")).strip(),
         "created_at": int(time.time()),
     }
@@ -445,20 +491,7 @@ def book():
     save_bookings()
     push_change("upsert", item)
 
-    # garante cliente básico
-    if client_id:
-        c = CLIENTS.get(client_id) or {"id": client_id, "created_at": int(time.time())}
-        if item.get("name"):
-            c.setdefault("name", item["name"])
-        if item.get("phone"):
-            c.setdefault("phone", item["phone"])
-        if item.get("email"):
-            c.setdefault("email", item["email"])
-        c["updated_at"] = int(time.time())
-        CLIENTS[client_id] = c
-        save_clients()
-
-    return jsonify({"ok": True, "id": bid})
+    return jsonify({"ok": True, "id": bid, "client_id": client_id})
 
 # -------------------------
 # BRIDGE: PULL / SYNC / REPLACE_ALL
@@ -728,7 +761,7 @@ def admin_validate_and_email(bid):
     })
 
 # -------------------------
-# ADMIN: CLIENTES (CRUD + upload foto)
+# ADMIN: CLIENTES (CRUD + upload foto) + ✅ DELETE
 # -------------------------
 @app.get("/admin/clients")
 def admin_clients_list():
@@ -774,7 +807,9 @@ def admin_clients_upsert():
     if name:  c["name"] = name
     if phone: c["phone"] = phone
     if email: c["email"] = email
-    if "notes" in data and str(data.get("notes") or "").strip():
+
+    # permite limpar notas também
+    if "notes" in data:
         c["notes"] = str(data.get("notes") or "").strip()
 
     c["updated_at"] = int(time.time())
@@ -787,6 +822,56 @@ def admin_clients_upsert():
     CLIENTS[cid] = c
     save_clients()
     return jsonify({"ok": True, "id": cid, "item": c})
+
+def _delete_client_internal(cid: str):
+    # remove cliente
+    existed = CLIENTS.pop(cid, None)
+
+    # remove uploads do cliente
+    if UPLOADS_DIR:
+        p = os.path.join(UPLOADS_DIR, cid)
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+
+    # limpa referências em bookings (para não ficar apontar para cliente morto)
+    changed = 0
+    for bid, b in BOOKINGS.items():
+        if (b.get("client_id") or "").strip() == cid:
+            b["client_id"] = ""
+            changed += 1
+
+    if existed is not None:
+        save_clients()
+    if changed:
+        save_bookings()
+
+    return existed, changed
+
+@app.delete("/admin/client/<cid>")
+def admin_client_delete(cid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    if cid not in CLIENTS:
+        return bad("not found", 404)
+
+    existed, changed = _delete_client_internal(cid)
+    return jsonify({"ok": True, "deleted": cid, "bookings_unlinked": changed, "item": existed})
+
+@app.post("/admin/client/<cid>/delete")
+def admin_client_delete_post(cid):
+    # fallback p/ quem não consegue fazer DELETE no browser antigo
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    if cid not in CLIENTS:
+        return bad("not found", 404)
+
+    existed, changed = _delete_client_internal(cid)
+    return jsonify({"ok": True, "deleted": cid, "bookings_unlinked": changed, "item": existed})
 
 @app.post("/admin/client/<cid>/photo")
 def admin_client_upload_photo(cid):
