@@ -9,7 +9,7 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from collections import deque
-import os, time, secrets, json, shutil
+import os, time, secrets, json, shutil, re
 
 # ✅ email
 import smtplib, ssl, socket
@@ -42,16 +42,13 @@ SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 
 BOOKINGS = {}                    # id -> booking dict (persistente)
 CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
-CLIENTS  = {}                    # client_id -> client dict (persistente)
+CLIENTS  = {}                    # client_id(str int) -> client dict (persistente)
 
 # -------------------------
 # IDS
 # -------------------------
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
-
-def now_client_id():
-    return "C-" + str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(2)
 
 # -------------------------
 # Helpers
@@ -69,7 +66,7 @@ def norm_phone(p: str) -> str:
     p = (p or "").strip()
     if not p:
         return ""
-    digits = "".join([c for c in p if c.isdigit()])
+    digits = re.sub(r"\D+", "", p)
     if len(digits) == 12 and digits.startswith("351"):
         digits = digits[3:]
     return digits
@@ -78,36 +75,23 @@ def norm_email(e: str) -> str:
     return (e or "").strip().lower()
 
 def _guess_base_url():
-    """
-    Se não houver request context (ex: chamadas internas), tenta usar RENDER_EXTERNAL_URL.
-    """
     base = (os.environ.get("RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
     if base:
         return base
-    # fallback: nada garantido
     return ""
 
 def abs_url(u: str) -> str:
-    """
-    Transforma /files/... em URL absoluta com base no host atual.
-    Se não houver request context, usa RENDER_EXTERNAL_URL (se existir).
-    """
     u = (u or "").strip()
     if not u:
         return ""
     if u.startswith("http://") or u.startswith("https://"):
         return u
-
-    # request context?
     try:
         base = request.host_url.rstrip("/")
     except Exception:
         base = _guess_base_url()
-
     if not base:
-        # último fallback: devolve como veio (para não crashar)
         return u
-
     if u.startswith("/"):
         return base + u
     return base + "/" + u
@@ -139,6 +123,7 @@ def pick_data_dir():
 DATA_DIR = pick_data_dir()
 BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
 CLIENTS_FILE  = os.path.join(DATA_DIR, "clients.json")  if DATA_DIR else None
+CLIENT_ID_COUNTER_FILE = os.path.join(DATA_DIR, "client_id_counter.json") if DATA_DIR else None
 
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads") if DATA_DIR else None
 if UPLOADS_DIR:
@@ -190,8 +175,46 @@ def save_clients():
         json.dump(CLIENTS, f, ensure_ascii=False)
     os.replace(tmp, CLIENTS_FILE)
 
+def _load_counter():
+    # {"next": 1}
+    if not CLIENT_ID_COUNTER_FILE:
+        return {"next": 1}
+    try:
+        if os.path.exists(CLIENT_ID_COUNTER_FILE):
+            with open(CLIENT_ID_COUNTER_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and isinstance(d.get("next"), int) and d["next"] >= 1:
+                return d
+    except Exception:
+        pass
+    return {"next": 1}
+
+def _save_counter(counter):
+    if not CLIENT_ID_COUNTER_FILE:
+        return
+    tmp = CLIENT_ID_COUNTER_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(counter, f, ensure_ascii=False)
+    os.replace(tmp, CLIENT_ID_COUNTER_FILE)
+
+def _recalc_counter_from_clients():
+    # garante que next = max(existing_ids)+1 (só para IDs inteiros)
+    max_id = 0
+    for cid in CLIENTS.keys():
+        s = str(cid).strip()
+        if s.isdigit():
+            max_id = max(max_id, int(s))
+    counter = _load_counter()
+    if counter.get("next", 1) <= max_id:
+        counter["next"] = max_id + 1
+        _save_counter(counter)
+    return counter
+
+COUNTER = None
+
 load_bookings()
 load_clients()
+COUNTER = _recalc_counter_from_clients()
 
 # snapshot em memória (para bridge puxar após restart)
 CHANGES.clear()
@@ -268,15 +291,82 @@ Barbearia
         return False, f"{type(e).__name__}: {e}"
 
 # -------------------------
+# CLIENT ID helpers (inteiro, persistente)
+# -------------------------
+def _next_client_id_str():
+    global COUNTER
+    if COUNTER is None:
+        COUNTER = _load_counter()
+    cid = int(COUNTER.get("next", 1) or 1)
+    COUNTER["next"] = cid + 1
+    _save_counter(COUNTER)
+    return str(cid)
+
+def _find_client_id_by_email_or_phone(email: str, phone: str) -> str:
+    e = norm_email(email or "")
+    p = norm_phone(phone or "")
+    if e:
+        for cid, c in CLIENTS.items():
+            if norm_email(c.get("email") or "") == e:
+                return str(cid)
+    if p:
+        for cid, c in CLIENTS.items():
+            if norm_phone(c.get("phone") or "") == p:
+                return str(cid)
+    return ""
+
+def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") -> str:
+    """
+    Garante que existe um cliente:
+    - se vier client_id válido e existir -> usa
+    - senão tenta dedupe por email/telefone
+    - senão cria novo ID inteiro
+    """
+    cid = (client_id or "").strip()
+
+    # se vier cid e existir, ok
+    if cid and cid in CLIENTS:
+        c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
+    else:
+        # dedupe por contacto
+        hit = _find_client_id_by_email_or_phone(email, phone)
+        if hit and hit in CLIENTS:
+            cid = hit
+            c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
+        else:
+            cid = _next_client_id_str()
+            c = {"id": cid, "created_at": int(time.time())}
+
+    # atualizar básicos (não estraga fotos/notes)
+    name = (name or "").strip()
+    phone = norm_phone(phone or "")
+    email = norm_email(email or "")
+
+    if name and not (c.get("name") or "").strip():
+        c["name"] = name
+    if phone and not (c.get("phone") or "").strip():
+        c["phone"] = phone
+    if email and not (c.get("email") or "").strip():
+        c["email"] = email
+
+    c["updated_at"] = int(time.time())
+    CLIENTS[cid] = c
+    save_clients()
+    return cid
+
+# -------------------------
 # HOME / HEALTH
 # -------------------------
 @app.get("/")
 def home():
-    # Ajuda a perceber se ESTE código está deployed
     try:
         rules_count = len(list(app.url_map.iter_rules()))
     except Exception:
         rules_count = -1
+
+    # para debug: próximo id
+    counter = _load_counter()
+    client_id_next = counter.get("next", None)
 
     return jsonify({
         "ok": True,
@@ -286,6 +376,7 @@ def home():
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES),
         "clients": len(CLIENTS),
+        "client_id_next": client_id_next,
         "persist": BOOKINGS_FILE or "NO_PERSIST",
         "data_dir": DATA_DIR or "NO_DATA_DIR",
         "uploads_dir": UPLOADS_DIR or "NO_UPLOADS",
@@ -346,7 +437,7 @@ def bridge_clients():
         after_u  = (c.get("photo_after_url") or "").strip()
 
         items.append({
-            "id": (c.get("id") or cid),
+            "id": str(c.get("id") or cid),  # <= "1","2","3"
             "name": (c.get("name") or ""),
             "phone": norm_phone(c.get("phone") or ""),
             "email": norm_email(c.get("email") or ""),
@@ -354,7 +445,7 @@ def bridge_clients():
             "photo_after_url": abs_url(after_u) if after_u else "",
         })
 
-    items.sort(key=lambda x: (x.get("name",""), x.get("id","")))
+    items.sort(key=lambda x: (x.get("name",""), int(x.get("id","0") or 0)))
     return jsonify({"ok": True, "items": items})
 
 # -------------------------
@@ -409,19 +500,6 @@ def admin_test_email():
 # -------------------------
 # CLIENTE: CRIAR MARCAÇÃO (✅ cria cliente na 1ª marcação)
 # -------------------------
-def _find_client_id_by_email_or_phone(email: str, phone: str) -> str:
-    e = norm_email(email or "")
-    p = norm_phone(phone or "")
-    if e:
-        for cid, c in CLIENTS.items():
-            if norm_email(c.get("email") or "") == e:
-                return cid
-    if p:
-        for cid, c in CLIENTS.items():
-            if norm_phone(c.get("phone") or "") == p:
-                return cid
-    return ""
-
 @app.post("/book")
 def book():
     data = request.get_json(silent=True) or {}
@@ -437,38 +515,10 @@ def book():
     phone = norm_phone(str(data.get("phone", "")).strip())
     email = norm_email(str(data.get("email", "")).strip())
 
-    client_id = str(data.get("client_id", "")).strip()
+    incoming_client_id = str(data.get("client_id", "")).strip()
 
-    # ✅ se não vier client_id, dedupe/cria automaticamente
-    if not client_id:
-        hit = _find_client_id_by_email_or_phone(email, phone)
-        if hit:
-            client_id = hit
-        else:
-            client_id = now_client_id()
-            CLIENTS[client_id] = {
-                "id": client_id,
-                "name": name,
-                "phone": phone,
-                "email": email,
-                "notes": "",
-                "created_at": int(time.time()),
-                "updated_at": int(time.time()),
-            }
-            save_clients()
-
-    # ✅ garante que o cliente existe e atualiza básicos
-    if client_id:
-        c = CLIENTS.get(client_id) or {"id": client_id, "created_at": int(time.time())}
-        if name:
-            c.setdefault("name", name)
-        if phone:
-            c.setdefault("phone", phone)
-        if email:
-            c.setdefault("email", email)
-        c["updated_at"] = int(time.time())
-        CLIENTS[client_id] = c
-        save_clients()
+    # ✅ sempre resolve/garante cliente com ID inteiro
+    client_id = ensure_client_basic(name=name, phone=phone, email=email, client_id=incoming_client_id)
 
     item = {
         "id": bid,
@@ -543,18 +593,14 @@ def sync():
             push_change("upsert", BOOKINGS[bid])
             applied += 1
 
-            cid = (BOOKINGS[bid].get("client_id") or "").strip()
+            cid = str((BOOKINGS[bid].get("client_id") or "")).strip()
             if cid:
-                c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
-                if BOOKINGS[bid].get("name"):
-                    c["name"] = BOOKINGS[bid]["name"]
-                if BOOKINGS[bid].get("phone"):
-                    c["phone"] = norm_phone(BOOKINGS[bid]["phone"])
-                if BOOKINGS[bid].get("email"):
-                    c["email"] = norm_email(BOOKINGS[bid]["email"])
-                c["updated_at"] = int(time.time())
-                CLIENTS[cid] = c
-                save_clients()
+                ensure_client_basic(
+                    name=BOOKINGS[bid].get("name",""),
+                    phone=BOOKINGS[bid].get("phone",""),
+                    email=BOOKINGS[bid].get("email",""),
+                    client_id=cid
+                )
 
     return jsonify({"ok": True, "applied": applied})
 
@@ -578,17 +624,14 @@ def replace_all():
             continue
         BOOKINGS[bid] = b
 
-        cid = (b.get("client_id") or "").strip()
+        cid = str((b.get("client_id") or "")).strip()
         if cid:
-            c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
-            if b.get("name"):
-                c["name"] = b.get("name")
-            if b.get("phone"):
-                c["phone"] = norm_phone(b.get("phone"))
-            if b.get("email"):
-                c["email"] = norm_email(b.get("email"))
-            c["updated_at"] = int(time.time())
-            CLIENTS[cid] = c
+            ensure_client_basic(
+                name=b.get("name",""),
+                phone=b.get("phone",""),
+                email=b.get("email",""),
+                client_id=cid
+            )
 
     save_bookings()
     save_clients()
@@ -773,13 +816,18 @@ def admin_clients_list():
 
     if q:
         def hit(c):
-            return (q in (c.get("id","").lower())
+            return (q in str(c.get("id","")).lower()
                     or q in (c.get("name","").lower())
                     or q in (c.get("phone","").lower())
                     or q in (c.get("email","").lower()))
         items = [c for c in items if hit(c)]
 
-    items.sort(key=lambda x: (x.get("name",""), x.get("phone",""), x.get("id","")))
+    # ordenar por ID inteiro quando possível
+    def _k(x):
+        sid = str(x.get("id","")).strip()
+        return (x.get("name",""), int(sid) if sid.isdigit() else 10**18, sid)
+    items.sort(key=_k)
+
     return jsonify({"ok": True, "items": items})
 
 @app.get("/admin/client/<cid>")
@@ -797,37 +845,47 @@ def admin_clients_upsert():
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-    cid = (data.get("id") or "").strip() or now_client_id()
+    incoming_id = str((data.get("id") or "")).strip()
 
-    c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     name  = (data.get("name") or "").strip()
     phone = norm_phone(data.get("phone") or "")
     email = norm_email(data.get("email") or "")
+
+    # ✅ se não vier ID, tenta dedupe por contacto, senão cria ID inteiro novo
+    cid = incoming_id
+    if not cid:
+        hit = _find_client_id_by_email_or_phone(email, phone)
+        if hit:
+            cid = hit
+        else:
+            cid = _next_client_id_str()
+
+    c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
 
     if name:  c["name"] = name
     if phone: c["phone"] = phone
     if email: c["email"] = email
 
-    # permite limpar notas também
     if "notes" in data:
         c["notes"] = str(data.get("notes") or "").strip()
-
-    c["updated_at"] = int(time.time())
 
     if data.get("photo_before_url") is not None:
         c["photo_before_url"] = str(data.get("photo_before_url") or "").strip()
     if data.get("photo_after_url") is not None:
         c["photo_after_url"] = str(data.get("photo_after_url") or "").strip()
 
+    c["updated_at"] = int(time.time())
     CLIENTS[cid] = c
     save_clients()
+
+    # manter counter coerente
+    _recalc_counter_from_clients()
+
     return jsonify({"ok": True, "id": cid, "item": c})
 
 def _delete_client_internal(cid: str):
-    # remove cliente
     existed = CLIENTS.pop(cid, None)
 
-    # remove uploads do cliente
     if UPLOADS_DIR:
         p = os.path.join(UPLOADS_DIR, cid)
         try:
@@ -836,10 +894,9 @@ def _delete_client_internal(cid: str):
         except Exception:
             pass
 
-    # limpa referências em bookings (para não ficar apontar para cliente morto)
     changed = 0
     for bid, b in BOOKINGS.items():
-        if (b.get("client_id") or "").strip() == cid:
+        if str((b.get("client_id") or "")).strip() == cid:
             b["client_id"] = ""
             changed += 1
 
@@ -854,7 +911,6 @@ def _delete_client_internal(cid: str):
 def admin_client_delete(cid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-
     if cid not in CLIENTS:
         return bad("not found", 404)
 
@@ -863,10 +919,8 @@ def admin_client_delete(cid):
 
 @app.post("/admin/client/<cid>/delete")
 def admin_client_delete_post(cid):
-    # fallback p/ quem não consegue fazer DELETE no browser antigo
     if not is_admin(request):
         return bad("unauthorized", 401)
-
     if cid not in CLIENTS:
         return bad("not found", 404)
 
