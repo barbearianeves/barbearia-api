@@ -96,6 +96,22 @@ def abs_url(u: str) -> str:
         return base + u
     return base + "/" + u
 
+# =========================
+# ✅ FIX: normalizar client_id vindo do exterior
+# - se vier "000001" -> "1"
+# - se vier "1" -> "1"
+# - se vier lixo -> ""
+# =========================
+def norm_client_id(cid: str) -> str:
+    s = str(cid or "").strip()
+    if not s:
+        return ""
+    if s.isdigit():
+        # remove zeros à esquerda mas mantém "0" se fosse (não deve acontecer)
+        n = int(s)
+        return str(n) if n > 0 else ""
+    return ""
+
 # -------------------------
 # STORAGE: escolher diretório escrevível
 # -------------------------
@@ -322,7 +338,8 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
     - senão tenta dedupe por email/telefone
     - senão cria novo ID inteiro
     """
-    cid = (client_id or "").strip()
+    # ✅ FIX: normaliza
+    cid = norm_client_id(client_id)
 
     # se vier cid e existir, ok
     if cid and cid in CLIENTS:
@@ -330,6 +347,7 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
     else:
         # dedupe por contacto
         hit = _find_client_id_by_email_or_phone(email, phone)
+        hit = norm_client_id(hit)
         if hit and hit in CLIENTS:
             cid = hit
             c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
@@ -342,16 +360,22 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
     phone = norm_phone(phone or "")
     email = norm_email(email or "")
 
-    if name and not (c.get("name") or "").strip():
+    # ✅ FIX: atualiza sempre nome/telefone/email se vier preenchido
+    # (para a App C bater certo logo na primeira marcação)
+    if name:
         c["name"] = name
-    if phone and not (c.get("phone") or "").strip():
+    if phone:
         c["phone"] = phone
-    if email and not (c.get("email") or "").strip():
+    if email:
         c["email"] = email
 
     c["updated_at"] = int(time.time())
     CLIENTS[cid] = c
     save_clients()
+
+    # ✅ FIX: manter counter coerente
+    _recalc_counter_from_clients()
+
     return cid
 
 # -------------------------
@@ -364,7 +388,6 @@ def home():
     except Exception:
         rules_count = -1
 
-    # para debug: próximo id
     counter = _load_counter()
     client_id_next = counter.get("next", None)
 
@@ -409,7 +432,7 @@ def debug_routes():
 
 @app.get("/debug/client/<cid>")
 def debug_client(cid):
-    c = CLIENTS.get(cid)
+    c = CLIENTS.get(str(cid))
     return jsonify({"ok": True, "item": c or None})
 
 # -------------------------
@@ -445,7 +468,11 @@ def bridge_clients():
             "photo_after_url": abs_url(after_u) if after_u else "",
         })
 
-    items.sort(key=lambda x: (x.get("name",""), int(x.get("id","0") or 0)))
+    # ✅ FIX: ordenar por ID inteiro sem crash
+    def _sid(x):
+        s = str(x.get("id","")).strip()
+        return int(s) if s.isdigit() else 10**18
+    items.sort(key=lambda x: (x.get("name",""), _sid(x), str(x.get("id",""))))
     return jsonify({"ok": True, "items": items})
 
 # -------------------------
@@ -498,7 +525,7 @@ def admin_test_email():
     return jsonify({"ok": ok, "message": msg})
 
 # -------------------------
-# CLIENTE: CRIAR MARCAÇÃO (✅ cria cliente na 1ª marcação)
+# CLIENTE: CRIAR MARCAÇÃO
 # -------------------------
 @app.post("/book")
 def book():
@@ -520,6 +547,12 @@ def book():
     # ✅ sempre resolve/garante cliente com ID inteiro
     client_id = ensure_client_basic(name=name, phone=phone, email=email, client_id=incoming_client_id)
 
+    # ✅ FIX: garantir que "client" no booking é o nome real (para a App C identificar logo)
+    client_name = name
+    c = CLIENTS.get(client_id)
+    if c and (c.get("name") or "").strip():
+        client_name = c.get("name")
+
     item = {
         "id": bid,
         "name": name,
@@ -532,8 +565,8 @@ def book():
         "dur": int(float(data.get("dur", 30))),
         "notes": str(data.get("notes", "")).strip(),
         "status": "Marcado",
-        "client_id": client_id,  # ✅ sempre preenchido
-        "client": str(data.get("client", "")).strip(),
+        "client_id": client_id,          # ✅ sempre preenchido
+        "client": client_name or "",     # ✅ FIX: nunca vazio/estranho
         "created_at": int(time.time()),
     }
 
@@ -589,11 +622,13 @@ def sync():
 
         elif op == "upsert":
             BOOKINGS[bid] = {**BOOKINGS.get(bid, {}), **payload}
+            # ✅ FIX: garantir types
+            BOOKINGS[bid]["client_id"] = norm_client_id(BOOKINGS[bid].get("client_id") or "")
             save_bookings()
             push_change("upsert", BOOKINGS[bid])
             applied += 1
 
-            cid = str((BOOKINGS[bid].get("client_id") or "")).strip()
+            cid = norm_client_id(BOOKINGS[bid].get("client_id") or "")
             if cid:
                 ensure_client_basic(
                     name=BOOKINGS[bid].get("name",""),
@@ -601,6 +636,11 @@ def sync():
                     email=BOOKINGS[bid].get("email",""),
                     client_id=cid
                 )
+                # ✅ FIX: manter "client" com nome
+                cc = CLIENTS.get(cid)
+                if cc and (cc.get("name") or "").strip():
+                    BOOKINGS[bid]["client"] = cc.get("name") or ""
+                    save_bookings()
 
     return jsonify({"ok": True, "applied": applied})
 
@@ -622,9 +662,11 @@ def replace_all():
         bid = str(b.get("id", "")).strip()
         if not bid:
             continue
-        BOOKINGS[bid] = b
 
-        cid = str((b.get("client_id") or "")).strip()
+        # ✅ FIX: normaliza client_id + client
+        cid = norm_client_id(b.get("client_id") or "")
+        b["client_id"] = cid
+
         if cid:
             ensure_client_basic(
                 name=b.get("name",""),
@@ -632,6 +674,13 @@ def replace_all():
                 email=b.get("email",""),
                 client_id=cid
             )
+            cc = CLIENTS.get(cid)
+            if cc and (cc.get("name") or "").strip():
+                b["client"] = cc.get("name") or ""
+        else:
+            b["client"] = (b.get("client") or "").strip()
+
+        BOOKINGS[bid] = b
 
     save_bookings()
     save_clients()
@@ -822,7 +871,6 @@ def admin_clients_list():
                     or q in (c.get("email","").lower()))
         items = [c for c in items if hit(c)]
 
-    # ordenar por ID inteiro quando possível
     def _k(x):
         sid = str(x.get("id","")).strip()
         return (x.get("name",""), int(sid) if sid.isdigit() else 10**18, sid)
@@ -834,6 +882,7 @@ def admin_clients_list():
 def admin_client_get(cid):
     if not is_admin(request):
         return bad("unauthorized", 401)
+    cid = norm_client_id(cid)
     c = CLIENTS.get(cid)
     if not c:
         return bad("not found", 404)
@@ -845,16 +894,16 @@ def admin_clients_upsert():
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-    incoming_id = str((data.get("id") or "")).strip()
+    incoming_id = norm_client_id(data.get("id") or "")
 
     name  = (data.get("name") or "").strip()
     phone = norm_phone(data.get("phone") or "")
     email = norm_email(data.get("email") or "")
 
-    # ✅ se não vier ID, tenta dedupe por contacto, senão cria ID inteiro novo
     cid = incoming_id
     if not cid:
         hit = _find_client_id_by_email_or_phone(email, phone)
+        hit = norm_client_id(hit)
         if hit:
             cid = hit
         else:
@@ -878,7 +927,6 @@ def admin_clients_upsert():
     CLIENTS[cid] = c
     save_clients()
 
-    # manter counter coerente
     _recalc_counter_from_clients()
 
     return jsonify({"ok": True, "id": cid, "item": c})
@@ -896,8 +944,9 @@ def _delete_client_internal(cid: str):
 
     changed = 0
     for bid, b in BOOKINGS.items():
-        if str((b.get("client_id") or "")).strip() == cid:
+        if norm_client_id(b.get("client_id") or "") == cid:
             b["client_id"] = ""
+            b["client"] = ""
             changed += 1
 
     if existed is not None:
@@ -911,7 +960,8 @@ def _delete_client_internal(cid: str):
 def admin_client_delete(cid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-    if cid not in CLIENTS:
+    cid = norm_client_id(cid)
+    if not cid or cid not in CLIENTS:
         return bad("not found", 404)
 
     existed, changed = _delete_client_internal(cid)
@@ -921,7 +971,8 @@ def admin_client_delete(cid):
 def admin_client_delete_post(cid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-    if cid not in CLIENTS:
+    cid = norm_client_id(cid)
+    if not cid or cid not in CLIENTS:
         return bad("not found", 404)
 
     existed, changed = _delete_client_internal(cid)
@@ -934,6 +985,10 @@ def admin_client_upload_photo(cid):
 
     if not UPLOADS_DIR:
         return bad("uploads disabled", 500)
+
+    cid = norm_client_id(cid)
+    if not cid:
+        return bad("client id inválido", 400)
 
     kind = (request.form.get("kind") or "before").strip().lower()
     if kind not in ["before", "after"]:
