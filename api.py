@@ -1,7 +1,9 @@
 # api.py — Barbearia API (bookings + clientes + fotos)
 # - /bridge/clients -> bridge no PC puxa URLs ABSOLUTOS das fotos
 # - /files/<path>   -> serve uploads (fotos) por URL
-# - /debug/routes   -> lista rotas (para matar "404 fantasma")
+# - /debug/routes   -> lista rotas
+# - /my-bookings    -> cliente vê as suas marcações
+# - /cancel-booking -> cliente cancela marcação pelo telefone
 #
 # Start (Render):
 #   gunicorn -w 1 api:app --bind 0.0.0.0:$PORT
@@ -12,12 +14,10 @@ from collections import deque
 from datetime import date
 import os, time, secrets, json, shutil, re
 
-# email
 import smtplib, ssl, socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# http p/ chamar o bridge no PC
 import requests
 
 app = Flask(__name__)
@@ -27,7 +27,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # CONFIG / SECRETS
 # =========================
 BRIDGE_SECRET = (os.environ.get("BRIDGE_SECRET", "neves-12345") or "").strip()
-ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN", "neves-12345") or "").strip()
+ADMIN_TOKEN   = (os.environ.get("ADMIN_TOKEN", "neves-12345") or "").strip()
 BRIDGE_PC_BASE = (os.environ.get("BRIDGE_PC_BASE", "") or "").strip().rstrip("/")
 
 FROM_EMAIL = (os.environ.get("FROM_EMAIL", "") or "").strip() or (os.environ.get("SMTP_USER", "") or "").strip()
@@ -36,19 +36,16 @@ SMTP_PORT  = int((os.environ.get("SMTP_PORT", "587") or "587").strip())
 SMTP_USER  = (os.environ.get("SMTP_USER", "") or "").strip() or FROM_EMAIL
 SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 
-BOOKINGS = {}                    # id -> booking dict (persistente)
-CHANGES  = deque(maxlen=20000)   # eventos para bridge (memória)
-CLIENTS  = {}                    # client_id(str int) -> client dict (persistente)
+BOOKINGS = {}                    # id -> booking dict
+CHANGES  = deque(maxlen=20000)   # eventos para bridge
+CLIENTS  = {}                    # client_id(str int) -> client dict
 
-# -------------------------
-# IDS
-# -------------------------
+# =========================
+# HELPERS GERAIS
+# =========================
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
 
-# -------------------------
-# Helpers
-# -------------------------
 def bad(msg, code=400):
     return jsonify({"error": msg}), code
 
@@ -58,8 +55,11 @@ def push_change(op, payload):
 def is_admin(req):
     return (req.headers.get("X-Admin-Token", "") or "").strip() == ADMIN_TOKEN
 
+def clean_str(v) -> str:
+    return str(v or "").replace("\r", "").replace("\n", "").strip()
+
 def norm_phone(p: str) -> str:
-    p = (p or "").strip()
+    p = clean_str(p)
     if not p:
         return ""
     digits = re.sub(r"\D+", "", p)
@@ -68,16 +68,23 @@ def norm_phone(p: str) -> str:
     return digits
 
 def norm_email(e: str) -> str:
-    return (e or "").strip().lower()
+    return clean_str(e).lower()
 
-def _guess_base_url():
-    base = (os.environ.get("RENDER_EXTERNAL_URL", "") or "").strip().rstrip("/")
-    if base:
-        return base
+def norm_client_id(cid: str) -> str:
+    s = clean_str(cid)
+    if not s:
+        return ""
+    if s.isdigit():
+        n = int(s)
+        return str(n) if n > 0 else ""
     return ""
 
+def _guess_base_url():
+    base = clean_str(os.environ.get("RENDER_EXTERNAL_URL", "") or "")
+    return base.rstrip("/") if base else ""
+
 def abs_url(u: str) -> str:
-    u = (u or "").strip()
+    u = clean_str(u)
     if not u:
         return ""
     if u.startswith("http://") or u.startswith("https://"):
@@ -93,25 +100,10 @@ def abs_url(u: str) -> str:
     return base + "/" + u
 
 # =========================
-# normalizar client_id vindo do exterior
-# - se vier "000001" -> "1"
-# - se vier "1" -> "1"
-# - se vier lixo -> ""
+# STORAGE
 # =========================
-def norm_client_id(cid: str) -> str:
-    s = str(cid or "").strip().replace("\r", "").replace("\n", "")
-    if not s:
-        return ""
-    if s.isdigit():
-        n = int(s)
-        return str(n) if n > 0 else ""
-    return ""
-
-# -------------------------
-# STORAGE: escolher diretório escrevível
-# -------------------------
 def pick_data_dir():
-    cand = (os.environ.get("DATA_DIR", "") or "").strip()
+    cand = clean_str(os.environ.get("DATA_DIR", "") or "")
     candidates = []
     if cand:
         candidates.append(cand)
@@ -133,7 +125,7 @@ def pick_data_dir():
 
 DATA_DIR = pick_data_dir()
 BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
-CLIENTS_FILE  = os.path.join(DATA_DIR, "clients.json")  if DATA_DIR else None
+CLIENTS_FILE  = os.path.join(DATA_DIR, "clients.json") if DATA_DIR else None
 CLIENT_ID_COUNTER_FILE = os.path.join(DATA_DIR, "client_id_counter.json") if DATA_DIR else None
 
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads") if DATA_DIR else None
@@ -210,7 +202,7 @@ def _save_counter(counter):
 def _recalc_counter_from_clients():
     max_id = 0
     for cid in CLIENTS.keys():
-        s = str(cid).strip()
+        s = clean_str(cid)
         if s.isdigit():
             max_id = max(max_id, int(s))
     counter = _load_counter()
@@ -229,9 +221,9 @@ CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
 
-# -------------------------
-# EMAIL: SMTP por IPv4 + logs
-# -------------------------
+# =========================
+# EMAIL
+# =========================
 def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
     ipv4 = None
     try:
@@ -240,12 +232,11 @@ def smtp_connect_ipv4(host: str, port: int, timeout: int = 20) -> smtplib.SMTP:
             ipv4 = infos[0][4][0]
     except Exception:
         ipv4 = None
-
     target = ipv4 or host
     return smtplib.SMTP(target, port, timeout=timeout)
 
 def send_validation_email(booking, subject=None, body=None):
-    to_email = (booking.get("email") or "").strip()
+    to_email = clean_str(booking.get("email") or "")
     if not to_email:
         return False, "Cliente sem email"
 
@@ -278,29 +269,22 @@ Barbearia
         msg["Subject"] = subj
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        print(f"[EMAIL] to={to_email} host={SMTP_HOST} port={SMTP_PORT} user={SMTP_USER}", flush=True)
-
         server = smtp_connect_ipv4(SMTP_HOST, SMTP_PORT, timeout=20)
         server.ehlo()
         server.starttls(context=ssl.create_default_context())
         server.ehlo()
-        print("[EMAIL] starttls OK", flush=True)
-
         server.login(SMTP_USER, SMTP_PASS)
-        print("[EMAIL] login OK", flush=True)
-
         server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-        print("[EMAIL] sendmail OK", flush=True)
-
         server.quit()
+
         return True, "Email enviado"
     except Exception as e:
         print(f"[EMAIL] ERRO: {type(e).__name__}: {e}", flush=True)
         return False, f"{type(e).__name__}: {e}"
 
-# -------------------------
-# CLIENT ID helpers (inteiro, persistente)
-# -------------------------
+# =========================
+# CLIENTES
+# =========================
 def _next_client_id_str():
     global COUNTER
     if COUNTER is None:
@@ -338,7 +322,7 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
             cid = _next_client_id_str()
             c = {"id": cid, "created_at": int(time.time())}
 
-    name = (name or "").strip()
+    name = clean_str(name)
     phone = norm_phone(phone or "")
     email = norm_email(email or "")
 
@@ -355,9 +339,9 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
     _recalc_counter_from_clients()
     return cid
 
-# -------------------------
-# HOME / HEALTH
-# -------------------------
+# =========================
+# HOME / DEBUG
+# =========================
 @app.get("/")
 def home():
     try:
@@ -366,7 +350,6 @@ def home():
         rules_count = -1
 
     counter = _load_counter()
-    client_id_next = counter.get("next", None)
 
     return jsonify({
         "ok": True,
@@ -376,12 +359,12 @@ def home():
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES),
         "clients": len(CLIENTS),
-        "client_id_next": client_id_next,
+        "client_id_next": counter.get("next", None),
         "persist": BOOKINGS_FILE or "NO_PERSIST",
         "data_dir": DATA_DIR or "NO_DATA_DIR",
         "uploads_dir": UPLOADS_DIR or "NO_UPLOADS",
         "bridge_pc_base": BRIDGE_PC_BASE or "",
-        "render_external_url": (os.environ.get("RENDER_EXTERNAL_URL","") or ""),
+        "render_external_url": clean_str(os.environ.get("RENDER_EXTERNAL_URL","") or ""),
         "smtp": {
             "from": FROM_EMAIL,
             "host": SMTP_HOST,
@@ -395,9 +378,6 @@ def home():
 def health():
     return jsonify({"ok": True})
 
-# -------------------------
-# DEBUG: ver rotas
-# -------------------------
 @app.get("/debug/routes")
 def debug_routes():
     out = []
@@ -409,12 +389,12 @@ def debug_routes():
 
 @app.get("/debug/client/<cid>")
 def debug_client(cid):
-    c = CLIENTS.get(str(norm_client_id(cid)))
+    c = CLIENTS.get(norm_client_id(cid))
     return jsonify({"ok": True, "item": c or None})
 
-# -------------------------
-# servir uploads por URL
-# -------------------------
+# =========================
+# FILES
+# =========================
 @app.get("/files/<path:filepath>")
 def files(filepath):
     if not UPLOADS_DIR:
@@ -422,41 +402,42 @@ def files(filepath):
     safe = filepath.replace("..", "").lstrip("/\\")
     return send_from_directory(UPLOADS_DIR, safe, as_attachment=False)
 
-# -------------------------
-# BRIDGE: CLIENTES (URLs ABSOLUTOS)
-# -------------------------
+# =========================
+# BRIDGE / PUBLIC CLIENTS
+# =========================
 @app.get("/bridge/clients")
 def bridge_clients():
-    secret = (request.args.get("secret") or "").strip()
+    secret = clean_str(request.args.get("secret") or "")
     if secret != BRIDGE_SECRET:
         return bad("unauthorized", 401)
 
     items = []
     for cid, c in CLIENTS.items():
-        before_u = (c.get("photo_before_url") or "").strip()
-        after_u  = (c.get("photo_after_url") or "").strip()
+        before_u = clean_str(c.get("photo_before_url") or "")
+        after_u  = clean_str(c.get("photo_after_url") or "")
 
         items.append({
             "id": str(c.get("id") or cid),
-            "name": (c.get("name") or ""),
+            "name": clean_str(c.get("name") or ""),
             "phone": norm_phone(c.get("phone") or ""),
             "email": norm_email(c.get("email") or ""),
+            "profession": clean_str(c.get("profession") or ""),
+            "age": clean_str(c.get("age") or ""),
+            "notes": clean_str(c.get("notes") or ""),
             "photo_before_url": abs_url(before_u) if before_u else "",
             "photo_after_url": abs_url(after_u) if after_u else "",
         })
 
     def _sid(x):
-        s = str(x.get("id","")).strip()
+        s = clean_str(x.get("id",""))
         return int(s) if s.isdigit() else 10**18
+
     items.sort(key=lambda x: (x.get("name",""), _sid(x), str(x.get("id",""))))
     return jsonify({"ok": True, "items": items})
 
-# -------------------------
-# PUBLIC: clientes (SÓ os do PC via BRIDGE_PC_BASE)
-# -------------------------
 @app.get("/public/clients")
 def public_clients():
-    secret = (request.args.get("secret") or "").strip()
+    secret = clean_str(request.args.get("secret") or "")
     if secret != BRIDGE_SECRET:
         return bad("unauthorized", 401)
 
@@ -475,16 +456,16 @@ def public_clients():
     except Exception as e:
         return bad(f"bridge pc offline: {type(e).__name__}: {e}", 502)
 
-# -------------------------
-# ADMIN: TESTE EMAIL
-# -------------------------
+# =========================
+# EMAIL TEST
+# =========================
 @app.post("/admin/test_email")
 def admin_test_email():
     if not is_admin(request):
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-    to_email = (data.get("to") or "").strip()
+    to_email = clean_str(data.get("to") or "")
     if not to_email:
         return bad("Campo obrigatório: to")
 
@@ -500,31 +481,30 @@ def admin_test_email():
     ok, msg = send_validation_email(fake_booking, subject="✅ Teste SMTP - Barbearia")
     return jsonify({"ok": ok, "message": msg})
 
-# -------------------------
-# CLIENTE: CRIAR MARCAÇÃO
-# -------------------------
+# =========================
+# BOOK
+# =========================
 @app.post("/book")
 def book():
     data = request.get_json(silent=True) or {}
     required = ["name", "phone", "service", "barber", "date", "time", "dur"]
     for k in required:
-        if not str(data.get(k, "")).strip():
+        if not clean_str(data.get(k, "")):
             return bad(f"Campo obrigatório em falta: {k}")
 
-    t = str(data["time"]).strip()[:5]
-    bid = data.get("id") or now_id()
+    t = clean_str(data["time"])[:5]
+    bid = clean_str(data.get("id") or "") or now_id()
 
-    name = str(data.get("name", "")).strip()
-    phone = norm_phone(str(data.get("phone", "")).strip())
-    email = norm_email(str(data.get("email", "")).strip())
-
-    incoming_client_id = str(data.get("client_id", "")).strip()
+    name = clean_str(data.get("name", ""))
+    phone = norm_phone(data.get("phone", ""))
+    email = norm_email(data.get("email", ""))
+    incoming_client_id = clean_str(data.get("client_id", ""))
 
     client_id = ensure_client_basic(name=name, phone=phone, email=email, client_id=incoming_client_id)
 
     client_name = name
     c = CLIENTS.get(client_id)
-    if c and (c.get("name") or "").strip():
+    if c and clean_str(c.get("name") or ""):
         client_name = c.get("name")
 
     item = {
@@ -532,12 +512,12 @@ def book():
         "name": name,
         "phone": phone,
         "email": email,
-        "service": str(data.get("service", "")).strip(),
-        "barber": str(data.get("barber", "")).strip(),
-        "date": str(data.get("date", "")).strip(),
+        "service": clean_str(data.get("service", "")),
+        "barber": clean_str(data.get("barber", "")),
+        "date": clean_str(data.get("date", "")),
         "time": t,
         "dur": int(float(data.get("dur", 30))),
-        "notes": str(data.get("notes", "")).strip(),
+        "notes": clean_str(data.get("notes", "")),
         "status": "Marcado",
         "client_id": client_id,
         "client": client_name or "",
@@ -550,9 +530,9 @@ def book():
 
     return jsonify({"ok": True, "id": bid, "client_id": client_id})
 
-# -------------------------
-# CLIENTE: LISTAR AS SUAS MARCAÇÕES
-# -------------------------
+# =========================
+# CLIENTE: VER / CANCELAR
+# =========================
 @app.get("/my-bookings")
 def my_bookings():
     phone = norm_phone(request.args.get("phone", ""))
@@ -566,37 +546,34 @@ def my_bookings():
         if norm_phone(b.get("phone", "")) != phone:
             continue
 
-        bdate = str(b.get("date", "")).strip()
+        bdate = clean_str(b.get("date", ""))
         if bdate and bdate < today_iso:
             continue
 
         out.append({
-            "id": b.get("id", ""),
-            "date": b.get("date", ""),
-            "time": b.get("time", ""),
+            "id": clean_str(b.get("id", "")),
+            "date": clean_str(b.get("date", "")),
+            "time": clean_str(b.get("time", "")),
             "dur": b.get("dur", 45),
-            "name": b.get("name", ""),
+            "name": clean_str(b.get("name", "")),
             "phone": norm_phone(b.get("phone", "")),
             "email": norm_email(b.get("email", "")),
-            "barber": b.get("barber", ""),
-            "service": b.get("service", ""),
-            "status": b.get("status", "Marcado"),
-            "notes": b.get("notes", ""),
+            "barber": clean_str(b.get("barber", "")),
+            "service": clean_str(b.get("service", "")),
+            "status": clean_str(b.get("status", "Marcado")),
+            "notes": clean_str(b.get("notes", "")),
             "client_id": norm_client_id(b.get("client_id", "")),
-            "client": b.get("client", ""),
+            "client": clean_str(b.get("client", "")),
         })
 
     out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
     return jsonify({"ok": True, "items": out})
 
-# -------------------------
-# CLIENTE: CANCELAR A SUA MARCAÇÃO
-# -------------------------
 @app.post("/cancel-booking")
 def cancel_booking():
     data = request.get_json(silent=True) or {}
 
-    bid = str(data.get("id", "")).strip()
+    bid = clean_str(data.get("id", ""))
     phone = norm_phone(data.get("phone", ""))
 
     if not bid:
@@ -611,7 +588,7 @@ def cancel_booking():
     if norm_phone(b.get("phone", "")) != phone:
         return bad("Telefone não corresponde à marcação", 403)
 
-    if str(b.get("status", "")).strip() == "Cancelado":
+    if clean_str(b.get("status", "")) == "Cancelado":
         return jsonify({"ok": True, "id": bid, "status": "Cancelado"})
 
     BOOKINGS[bid]["status"] = "Cancelado"
@@ -620,18 +597,14 @@ def cancel_booking():
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
 
-    return jsonify({
-        "ok": True,
-        "id": bid,
-        "status": "Cancelado"
-    })
+    return jsonify({"ok": True, "id": bid, "status": "Cancelado"})
 
-# -------------------------
-# BRIDGE: PULL / SYNC / REPLACE_ALL
-# -------------------------
+# =========================
+# BRIDGE SYNC
+# =========================
 @app.get("/pull")
 def pull():
-    secret = request.args.get("secret", "")
+    secret = clean_str(request.args.get("secret", ""))
     if secret != BRIDGE_SECRET:
         return bad("unauthorized", 401)
 
@@ -645,7 +618,7 @@ def pull():
 
 @app.post("/sync")
 def sync():
-    secret = request.args.get("secret", "")
+    secret = clean_str(request.args.get("secret", ""))
     if secret != BRIDGE_SECRET:
         return bad("unauthorized", 401)
 
@@ -658,7 +631,7 @@ def sync():
     for ch in changes:
         op = ch.get("op")
         payload = ch.get("payload") or {}
-        bid = payload.get("id")
+        bid = clean_str(payload.get("id") or "")
         if not bid:
             continue
 
@@ -680,13 +653,13 @@ def sync():
             cid = norm_client_id(BOOKINGS[bid].get("client_id") or "")
             if cid:
                 ensure_client_basic(
-                    name=BOOKINGS[bid].get("name",""),
-                    phone=BOOKINGS[bid].get("phone",""),
-                    email=BOOKINGS[bid].get("email",""),
+                    name=BOOKINGS[bid].get("name", ""),
+                    phone=BOOKINGS[bid].get("phone", ""),
+                    email=BOOKINGS[bid].get("email", ""),
                     client_id=cid
                 )
                 cc = CLIENTS.get(cid)
-                if cc and (cc.get("name") or "").strip():
+                if cc and clean_str(cc.get("name") or ""):
                     BOOKINGS[bid]["client"] = cc.get("name") or ""
                     save_bookings()
 
@@ -694,7 +667,7 @@ def sync():
 
 @app.post("/replace_all")
 def replace_all():
-    secret = request.args.get("secret", "")
+    secret = clean_str(request.args.get("secret", ""))
     if secret != BRIDGE_SECRET:
         return bad("unauthorized", 401)
 
@@ -707,7 +680,7 @@ def replace_all():
     BOOKINGS = {}
 
     for b in items:
-        bid = str(b.get("id", "")).strip()
+        bid = clean_str(b.get("id", ""))
         if not bid:
             continue
 
@@ -716,16 +689,16 @@ def replace_all():
 
         if cid:
             ensure_client_basic(
-                name=b.get("name",""),
-                phone=b.get("phone",""),
-                email=b.get("email",""),
+                name=b.get("name", ""),
+                phone=b.get("phone", ""),
+                email=b.get("email", ""),
                 client_id=cid
             )
             cc = CLIENTS.get(cid)
-            if cc and (cc.get("name") or "").strip():
+            if cc and clean_str(cc.get("name") or ""):
                 b["client"] = cc.get("name") or ""
         else:
-            b["client"] = (b.get("client") or "").strip()
+            b["client"] = clean_str(b.get("client") or "")
 
         BOOKINGS[bid] = b
 
@@ -738,9 +711,9 @@ def replace_all():
 
     return jsonify({"ok": True, "count": len(BOOKINGS)})
 
-# -------------------------
-# CLIENTE: VER OCUPADOS/DIA
-# -------------------------
+# =========================
+# DAY / BUSY
+# =========================
 def _day_items_for_clients(date_: str = "", barber: str = ""):
     out = []
     for b in BOOKINGS.values():
@@ -755,38 +728,38 @@ def _day_items_for_clients(date_: str = "", barber: str = ""):
 
         is_block = (st == "Bloqueado") or (b.get("service") == "INDISPONIVEL")
         out.append({
-            "id": b.get("id", ""),
-            "time": b.get("time", ""),
+            "id": clean_str(b.get("id", "")),
+            "time": clean_str(b.get("time", "")),
             "dur": b.get("dur", 30),
-            "status": st,
+            "status": clean_str(st),
             "label": "INDISPONÍVEL" if is_block else "OCUPADO",
-            "service": b.get("service", ""),
-            "notes": b.get("notes", ""),
+            "service": clean_str(b.get("service", "")),
+            "notes": clean_str(b.get("notes", "")),
         })
     return out
 
 @app.get("/day")
 def day():
-    date_ = request.args.get("date", "")
-    barber = request.args.get("barber", "")
+    date_ = clean_str(request.args.get("date", ""))
+    barber = clean_str(request.args.get("barber", ""))
     return jsonify({"ok": True, "items": _day_items_for_clients(date_, barber)})
 
 @app.get("/busy")
 def busy():
-    date_ = request.args.get("date", "")
-    barber = request.args.get("barber", "")
+    date_ = clean_str(request.args.get("date", ""))
+    barber = clean_str(request.args.get("barber", ""))
     return jsonify({"ok": True, "items": _day_items_for_clients(date_, barber)})
 
-# -------------------------
-# ADMIN: LISTAR BOOKINGS
-# -------------------------
+# =========================
+# ADMIN BOOKINGS
+# =========================
 @app.get("/admin/bookings")
 def admin_list():
     if not is_admin(request):
         return bad("unauthorized", 401)
 
-    date_ = (request.args.get("date") or "").strip()
-    barber = (request.args.get("barber") or "").strip()
+    date_ = clean_str(request.args.get("date") or "")
+    barber = clean_str(request.args.get("barber") or "")
 
     out = []
     for b in BOOKINGS.values():
@@ -808,9 +781,6 @@ def admin_get_booking(bid):
         return bad("not found", 404)
     return jsonify({"ok": True, "item": b})
 
-# -------------------------
-# ADMIN: CANCELAR / BLOQUEAR / DESBLOQUEAR
-# -------------------------
 @app.post("/admin/cancel/<bid>")
 def admin_cancel(bid):
     if not is_admin(request):
@@ -828,9 +798,9 @@ def admin_block():
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-    date_ = str(data.get("date", "")).strip()
-    time_ = str(data.get("time", "")).strip()[:5]
-    barber = str(data.get("barber", "")).strip()
+    date_ = clean_str(data.get("date", ""))
+    time_ = clean_str(data.get("time", ""))[:5]
+    barber = clean_str(data.get("barber", ""))
 
     if not date_ or not time_ or not barber:
         return bad("Campos obrigatórios: date, time, barber")
@@ -869,9 +839,6 @@ def admin_unblock(bid):
     push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
-# -------------------------
-# ADMIN: VALIDAR + EMAIL
-# -------------------------
 @app.post("/admin/validate_and_email/<bid>")
 def admin_validate_and_email(bid):
     if not is_admin(request):
@@ -880,9 +847,9 @@ def admin_validate_and_email(bid):
         return bad("not found", 404)
 
     data = request.get_json(silent=True) or {}
-    new_status = (data.get("status") or "Chegou").strip()
+    new_status = clean_str(data.get("status") or "Chegou")
 
-    incoming_email = (data.get("email") or "").strip()
+    incoming_email = clean_str(data.get("email") or "")
     if incoming_email:
         BOOKINGS[bid]["email"] = incoming_email
 
@@ -899,30 +866,32 @@ def admin_validate_and_email(bid):
         "message": msg_email,
     })
 
-# -------------------------
-# ADMIN: CLIENTES (CRUD + upload foto) + DELETE
-# -------------------------
+# =========================
+# ADMIN CLIENTS
+# =========================
 @app.get("/admin/clients")
 def admin_clients_list():
     if not is_admin(request):
         return bad("unauthorized", 401)
 
-    q = (request.args.get("q") or "").strip().lower()
+    q = clean_str(request.args.get("q") or "").lower()
     items = list(CLIENTS.values())
 
     if q:
         def hit(c):
-            return (q in str(c.get("id","")).lower()
-                    or q in (c.get("name","").lower())
-                    or q in (c.get("phone","").lower())
-                    or q in (c.get("email","").lower()))
+            return (
+                q in str(c.get("id","")).lower()
+                or q in clean_str(c.get("name","")).lower()
+                or q in clean_str(c.get("phone","")).lower()
+                or q in clean_str(c.get("email","")).lower()
+            )
         items = [c for c in items if hit(c)]
 
     def _k(x):
-        sid = str(x.get("id","")).strip()
+        sid = clean_str(x.get("id",""))
         return (x.get("name",""), int(sid) if sid.isdigit() else 10**18, sid)
-    items.sort(key=_k)
 
+    items.sort(key=_k)
     return jsonify({"ok": True, "items": items})
 
 @app.get("/admin/client/<cid>")
@@ -943,9 +912,12 @@ def admin_clients_upsert():
     data = request.get_json(silent=True) or {}
     incoming_id = norm_client_id(data.get("id") or "")
 
-    name  = (data.get("name") or "").strip()
+    name  = clean_str(data.get("name") or "")
     phone = norm_phone(data.get("phone") or "")
     email = norm_email(data.get("email") or "")
+    profession = clean_str(data.get("profession") or "")
+    age = clean_str(data.get("age") or "")
+    notes = clean_str(data.get("notes") or "")
 
     cid = incoming_id
     if not cid:
@@ -964,14 +936,17 @@ def admin_clients_upsert():
         c["phone"] = phone
     if email:
         c["email"] = email
-
-    if "notes" in data:
-        c["notes"] = str(data.get("notes") or "").strip()
+    if profession:
+        c["profession"] = profession
+    if age:
+        c["age"] = age
+    if notes:
+        c["notes"] = notes
 
     if data.get("photo_before_url") is not None:
-        c["photo_before_url"] = str(data.get("photo_before_url") or "").strip()
+        c["photo_before_url"] = clean_str(data.get("photo_before_url") or "")
     if data.get("photo_after_url") is not None:
-        c["photo_after_url"] = str(data.get("photo_after_url") or "").strip()
+        c["photo_after_url"] = clean_str(data.get("photo_after_url") or "")
 
     c["updated_at"] = int(time.time())
     CLIENTS[cid] = c
@@ -1039,7 +1014,7 @@ def admin_client_upload_photo(cid):
     if not cid:
         return bad("client id inválido", 400)
 
-    kind = (request.form.get("kind") or "before").strip().lower()
+    kind = clean_str(request.form.get("kind") or "before").lower()
     if kind not in ["before", "after"]:
         return bad("kind inválido (before|after)")
 
@@ -1073,7 +1048,7 @@ def admin_client_upload_photo(cid):
         c["photo_after_url"] = url
         c["photo_after_at"] = int(time.time())
 
-    note = (request.form.get("note") or "").strip()
+    note = clean_str(request.form.get("note") or "")
     if note:
         c.setdefault("photo_notes", [])
         c["photo_notes"].append({"kind": kind, "note": note, "ts": int(time.time())})
