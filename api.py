@@ -9,14 +9,15 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from collections import deque
+from datetime import date
 import os, time, secrets, json, shutil, re
 
-# ✅ email
+# email
 import smtplib, ssl, socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# ✅ http p/ chamar o bridge no PC
+# http p/ chamar o bridge no PC
 import requests
 
 app = Flask(__name__)
@@ -26,14 +27,9 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # CONFIG / SECRETS
 # =========================
 BRIDGE_SECRET = (os.environ.get("BRIDGE_SECRET", "neves-12345") or "").strip()
-
-# ✅ ADMIN_TOKEN não deve ser igual ao BRIDGE_SECRET (mas podes manter igual via env)
 ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN", "neves-12345") or "").strip()
-
-# ✅ Onde está o bridge HTTP no PC (para listar clientes reais da app C)
 BRIDGE_PC_BASE = (os.environ.get("BRIDGE_PC_BASE", "") or "").strip().rstrip("/")
 
-# ✅ Email (Render envs)
 FROM_EMAIL = (os.environ.get("FROM_EMAIL", "") or "").strip() or (os.environ.get("SMTP_USER", "") or "").strip()
 SMTP_HOST  = (os.environ.get("SMTP_HOST", "smtp.gmail.com") or "").strip()
 SMTP_PORT  = int((os.environ.get("SMTP_PORT", "587") or "587").strip())
@@ -97,17 +93,16 @@ def abs_url(u: str) -> str:
     return base + "/" + u
 
 # =========================
-# ✅ FIX: normalizar client_id vindo do exterior
+# normalizar client_id vindo do exterior
 # - se vier "000001" -> "1"
 # - se vier "1" -> "1"
 # - se vier lixo -> ""
 # =========================
 def norm_client_id(cid: str) -> str:
-    s = str(cid or "").strip()
+    s = str(cid or "").strip().replace("\r", "").replace("\n", "")
     if not s:
         return ""
     if s.isdigit():
-        # remove zeros à esquerda mas mantém "0" se fosse (não deve acontecer)
         n = int(s)
         return str(n) if n > 0 else ""
     return ""
@@ -192,7 +187,6 @@ def save_clients():
     os.replace(tmp, CLIENTS_FILE)
 
 def _load_counter():
-    # {"next": 1}
     if not CLIENT_ID_COUNTER_FILE:
         return {"next": 1}
     try:
@@ -214,7 +208,6 @@ def _save_counter(counter):
     os.replace(tmp, CLIENT_ID_COUNTER_FILE)
 
 def _recalc_counter_from_clients():
-    # garante que next = max(existing_ids)+1 (só para IDs inteiros)
     max_id = 0
     for cid in CLIENTS.keys():
         s = str(cid).strip()
@@ -232,7 +225,6 @@ load_bookings()
 load_clients()
 COUNTER = _recalc_counter_from_clients()
 
-# snapshot em memória (para bridge puxar após restart)
 CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
@@ -332,20 +324,11 @@ def _find_client_id_by_email_or_phone(email: str, phone: str) -> str:
     return ""
 
 def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") -> str:
-    """
-    Garante que existe um cliente:
-    - se vier client_id válido e existir -> usa
-    - senão tenta dedupe por email/telefone
-    - senão cria novo ID inteiro
-    """
-    # ✅ FIX: normaliza
     cid = norm_client_id(client_id)
 
-    # se vier cid e existir, ok
     if cid and cid in CLIENTS:
         c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     else:
-        # dedupe por contacto
         hit = _find_client_id_by_email_or_phone(email, phone)
         hit = norm_client_id(hit)
         if hit and hit in CLIENTS:
@@ -355,13 +338,10 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
             cid = _next_client_id_str()
             c = {"id": cid, "created_at": int(time.time())}
 
-    # atualizar básicos (não estraga fotos/notes)
     name = (name or "").strip()
     phone = norm_phone(phone or "")
     email = norm_email(email or "")
 
-    # ✅ FIX: atualiza sempre nome/telefone/email se vier preenchido
-    # (para a App C bater certo logo na primeira marcação)
     if name:
         c["name"] = name
     if phone:
@@ -372,10 +352,7 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
     c["updated_at"] = int(time.time())
     CLIENTS[cid] = c
     save_clients()
-
-    # ✅ FIX: manter counter coerente
     _recalc_counter_from_clients()
-
     return cid
 
 # -------------------------
@@ -432,7 +409,7 @@ def debug_routes():
 
 @app.get("/debug/client/<cid>")
 def debug_client(cid):
-    c = CLIENTS.get(str(cid))
+    c = CLIENTS.get(str(norm_client_id(cid)))
     return jsonify({"ok": True, "item": c or None})
 
 # -------------------------
@@ -460,7 +437,7 @@ def bridge_clients():
         after_u  = (c.get("photo_after_url") or "").strip()
 
         items.append({
-            "id": str(c.get("id") or cid),  # <= "1","2","3"
+            "id": str(c.get("id") or cid),
             "name": (c.get("name") or ""),
             "phone": norm_phone(c.get("phone") or ""),
             "email": norm_email(c.get("email") or ""),
@@ -468,7 +445,6 @@ def bridge_clients():
             "photo_after_url": abs_url(after_u) if after_u else "",
         })
 
-    # ✅ FIX: ordenar por ID inteiro sem crash
     def _sid(x):
         s = str(x.get("id","")).strip()
         return int(s) if s.isdigit() else 10**18
@@ -544,10 +520,8 @@ def book():
 
     incoming_client_id = str(data.get("client_id", "")).strip()
 
-    # ✅ sempre resolve/garante cliente com ID inteiro
     client_id = ensure_client_basic(name=name, phone=phone, email=email, client_id=incoming_client_id)
 
-    # ✅ FIX: garantir que "client" no booking é o nome real (para a App C identificar logo)
     client_name = name
     c = CLIENTS.get(client_id)
     if c and (c.get("name") or "").strip():
@@ -565,8 +539,8 @@ def book():
         "dur": int(float(data.get("dur", 30))),
         "notes": str(data.get("notes", "")).strip(),
         "status": "Marcado",
-        "client_id": client_id,          # ✅ sempre preenchido
-        "client": client_name or "",     # ✅ FIX: nunca vazio/estranho
+        "client_id": client_id,
+        "client": client_name or "",
         "created_at": int(time.time()),
     }
 
@@ -575,6 +549,82 @@ def book():
     push_change("upsert", item)
 
     return jsonify({"ok": True, "id": bid, "client_id": client_id})
+
+# -------------------------
+# CLIENTE: LISTAR AS SUAS MARCAÇÕES
+# -------------------------
+@app.get("/my-bookings")
+def my_bookings():
+    phone = norm_phone(request.args.get("phone", ""))
+    if not phone:
+        return bad("Telefone em falta")
+
+    today_iso = date.today().isoformat()
+    out = []
+
+    for b in BOOKINGS.values():
+        if norm_phone(b.get("phone", "")) != phone:
+            continue
+
+        bdate = str(b.get("date", "")).strip()
+        if bdate and bdate < today_iso:
+            continue
+
+        out.append({
+            "id": b.get("id", ""),
+            "date": b.get("date", ""),
+            "time": b.get("time", ""),
+            "dur": b.get("dur", 45),
+            "name": b.get("name", ""),
+            "phone": norm_phone(b.get("phone", "")),
+            "email": norm_email(b.get("email", "")),
+            "barber": b.get("barber", ""),
+            "service": b.get("service", ""),
+            "status": b.get("status", "Marcado"),
+            "notes": b.get("notes", ""),
+            "client_id": norm_client_id(b.get("client_id", "")),
+            "client": b.get("client", ""),
+        })
+
+    out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
+    return jsonify({"ok": True, "items": out})
+
+# -------------------------
+# CLIENTE: CANCELAR A SUA MARCAÇÃO
+# -------------------------
+@app.post("/cancel-booking")
+def cancel_booking():
+    data = request.get_json(silent=True) or {}
+
+    bid = str(data.get("id", "")).strip()
+    phone = norm_phone(data.get("phone", ""))
+
+    if not bid:
+        return bad("ID em falta")
+    if not phone:
+        return bad("Telefone em falta")
+
+    b = BOOKINGS.get(bid)
+    if not b:
+        return bad("Marcação não encontrada", 404)
+
+    if norm_phone(b.get("phone", "")) != phone:
+        return bad("Telefone não corresponde à marcação", 403)
+
+    if str(b.get("status", "")).strip() == "Cancelado":
+        return jsonify({"ok": True, "id": bid, "status": "Cancelado"})
+
+    BOOKINGS[bid]["status"] = "Cancelado"
+    BOOKINGS[bid]["cancelled_at"] = int(time.time())
+
+    save_bookings()
+    push_change("upsert", BOOKINGS[bid])
+
+    return jsonify({
+        "ok": True,
+        "id": bid,
+        "status": "Cancelado"
+    })
 
 # -------------------------
 # BRIDGE: PULL / SYNC / REPLACE_ALL
@@ -622,7 +672,6 @@ def sync():
 
         elif op == "upsert":
             BOOKINGS[bid] = {**BOOKINGS.get(bid, {}), **payload}
-            # ✅ FIX: garantir types
             BOOKINGS[bid]["client_id"] = norm_client_id(BOOKINGS[bid].get("client_id") or "")
             save_bookings()
             push_change("upsert", BOOKINGS[bid])
@@ -636,7 +685,6 @@ def sync():
                     email=BOOKINGS[bid].get("email",""),
                     client_id=cid
                 )
-                # ✅ FIX: manter "client" com nome
                 cc = CLIENTS.get(cid)
                 if cc and (cc.get("name") or "").strip():
                     BOOKINGS[bid]["client"] = cc.get("name") or ""
@@ -663,7 +711,6 @@ def replace_all():
         if not bid:
             continue
 
-        # ✅ FIX: normaliza client_id + client
         cid = norm_client_id(b.get("client_id") or "")
         b["client_id"] = cid
 
@@ -694,10 +741,10 @@ def replace_all():
 # -------------------------
 # CLIENTE: VER OCUPADOS/DIA
 # -------------------------
-def _day_items_for_clients(date: str = "", barber: str = ""):
+def _day_items_for_clients(date_: str = "", barber: str = ""):
     out = []
     for b in BOOKINGS.values():
-        if date and b.get("date") != date:
+        if date_ and b.get("date") != date_:
             continue
         if barber and b.get("barber") != barber:
             continue
@@ -720,15 +767,15 @@ def _day_items_for_clients(date: str = "", barber: str = ""):
 
 @app.get("/day")
 def day():
-    date = request.args.get("date", "")
+    date_ = request.args.get("date", "")
     barber = request.args.get("barber", "")
-    return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
+    return jsonify({"ok": True, "items": _day_items_for_clients(date_, barber)})
 
 @app.get("/busy")
 def busy():
-    date = request.args.get("date", "")
+    date_ = request.args.get("date", "")
     barber = request.args.get("barber", "")
-    return jsonify({"ok": True, "items": _day_items_for_clients(date, barber)})
+    return jsonify({"ok": True, "items": _day_items_for_clients(date_, barber)})
 
 # -------------------------
 # ADMIN: LISTAR BOOKINGS
@@ -738,12 +785,12 @@ def admin_list():
     if not is_admin(request):
         return bad("unauthorized", 401)
 
-    date = (request.args.get("date") or "").strip()
+    date_ = (request.args.get("date") or "").strip()
     barber = (request.args.get("barber") or "").strip()
 
     out = []
     for b in BOOKINGS.values():
-        if date and b.get("date") != date:
+        if date_ and b.get("date") != date_:
             continue
         if barber and b.get("barber") != barber:
             continue
@@ -781,11 +828,11 @@ def admin_block():
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-    date = str(data.get("date", "")).strip()
+    date_ = str(data.get("date", "")).strip()
     time_ = str(data.get("time", "")).strip()[:5]
     barber = str(data.get("barber", "")).strip()
 
-    if not date or not time_ or not barber:
+    if not date_ or not time_ or not barber:
         return bad("Campos obrigatórios: date, time, barber")
 
     bid = now_id()
@@ -796,7 +843,7 @@ def admin_block():
         "email": "",
         "service": "INDISPONIVEL",
         "barber": barber,
-        "date": date,
+        "date": date_,
         "time": time_,
         "dur": 30,
         "notes": "",
@@ -853,7 +900,7 @@ def admin_validate_and_email(bid):
     })
 
 # -------------------------
-# ADMIN: CLIENTES (CRUD + upload foto) + ✅ DELETE
+# ADMIN: CLIENTES (CRUD + upload foto) + DELETE
 # -------------------------
 @app.get("/admin/clients")
 def admin_clients_list():
@@ -911,9 +958,12 @@ def admin_clients_upsert():
 
     c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
 
-    if name:  c["name"] = name
-    if phone: c["phone"] = phone
-    if email: c["email"] = email
+    if name:
+        c["name"] = name
+    if phone:
+        c["phone"] = phone
+    if email:
+        c["email"] = email
 
     if "notes" in data:
         c["notes"] = str(data.get("notes") or "").strip()
@@ -926,7 +976,6 @@ def admin_clients_upsert():
     c["updated_at"] = int(time.time())
     CLIENTS[cid] = c
     save_clients()
-
     _recalc_counter_from_clients()
 
     return jsonify({"ok": True, "id": cid, "item": c})
