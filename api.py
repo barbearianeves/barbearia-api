@@ -1,10 +1,4 @@
 # api.py — Barbearia API (bookings + clientes + fotos)
-# - /bridge/clients -> bridge no PC puxa URLs ABSOLUTOS das fotos
-# - /files/<path>   -> serve uploads (fotos) por URL
-# - /debug/routes   -> lista rotas
-# - /my-bookings    -> cliente vê as suas marcações
-# - /cancel-booking -> cliente cancela marcação pelo telefone
-#
 # Start (Render):
 #   gunicorn -w 1 api:app --bind 0.0.0.0:$PORT
 
@@ -36,9 +30,9 @@ SMTP_PORT  = int((os.environ.get("SMTP_PORT", "587") or "587").strip())
 SMTP_USER  = (os.environ.get("SMTP_USER", "") or "").strip() or FROM_EMAIL
 SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 
-BOOKINGS = {}                    # id -> booking dict
-CHANGES  = deque(maxlen=20000)   # eventos para bridge
-CLIENTS  = {}                    # client_id(str int) -> client dict
+BOOKINGS = {}
+CHANGES  = deque(maxlen=20000)
+CLIENTS  = {}
 
 # =========================
 # HELPERS GERAIS
@@ -866,6 +860,33 @@ def admin_validate_and_email(bid):
         "message": msg_email,
     })
 
+@app.post("/admin/booking/<bid>/link-client")
+def admin_link_client(bid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+    if bid not in BOOKINGS:
+        return bad("not found", 404)
+
+    data = request.get_json(silent=True) or {}
+    cid = norm_client_id(data.get("client_id") or "")
+    if not cid or cid not in CLIENTS:
+        return bad("cliente não encontrado", 404)
+
+    BOOKINGS[bid]["client_id"] = cid
+    BOOKINGS[bid]["client"] = clean_str(CLIENTS[cid].get("name") or "")
+
+    c = CLIENTS.get(cid) or {}
+    if clean_str(c.get("phone") or ""):
+        BOOKINGS[bid]["phone"] = norm_phone(c.get("phone") or "")
+    if clean_str(c.get("email") or ""):
+        BOOKINGS[bid]["email"] = norm_email(c.get("email") or "")
+    if clean_str(c.get("name") or ""):
+        BOOKINGS[bid]["name"] = clean_str(c.get("name") or "")
+
+    save_bookings()
+    push_change("upsert", BOOKINGS[bid])
+    return jsonify({"ok": True, "item": BOOKINGS[bid]})
+
 # =========================
 # ADMIN CLIENTS
 # =========================
@@ -1019,7 +1040,9 @@ def admin_client_upload_photo(cid):
     if not f or not f.filename:
         return bad("Ficheiro inválido")
 
-    c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
+    c = CLIENTS.get(cid)
+    if not c:
+        return bad("cliente não encontrado", 404)
 
     ext = os.path.splitext(f.filename)[1].lower()
     if ext not in [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]:
