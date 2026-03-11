@@ -815,7 +815,7 @@ def admin_block():
         "barber": barber,
         "date": date_,
         "time": time_,
-        "dur": 30,
+        "dur": 45,
         "notes": "",
         "status": "Bloqueado",
         "client_id": "",
@@ -930,18 +930,12 @@ def admin_clients_upsert():
 
     c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
 
-    if name:
-        c["name"] = name
-    if phone:
-        c["phone"] = phone
-    if email:
-        c["email"] = email
-    if profession:
-        c["profession"] = profession
-    if age:
-        c["age"] = age
-    if notes:
-        c["notes"] = notes
+    c["name"] = name
+    c["phone"] = phone
+    c["email"] = email
+    c["profession"] = profession
+    c["age"] = age
+    c["notes"] = notes
 
     if data.get("photo_before_url") is not None:
         c["photo_before_url"] = clean_str(data.get("photo_before_url") or "")
