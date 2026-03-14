@@ -139,6 +139,9 @@ DATA_DIR = pick_data_dir()
 BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
 CLIENTS_FILE  = os.path.join(DATA_DIR, "clients.json") if DATA_DIR else None
 CLIENT_ID_COUNTER_FILE = os.path.join(DATA_DIR, "client_id_counter.json") if DATA_DIR else None
+RESET_CLIENTS_STATE_FILE = os.path.join(DATA_DIR, "reset_clients_state.json") if DATA_DIR else None
+
+ALLOW_MULTI_RESET_SAME_DAY = int((os.environ.get("ALLOW_MULTI_RESET_SAME_DAY", "0") or "0"))
 
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads") if DATA_DIR else None
 if UPLOADS_DIR:
@@ -222,6 +225,38 @@ def _recalc_counter_from_clients():
         counter["next"] = max_id + 1
         _save_counter(counter)
     return counter
+
+def _today_iso():
+    return date.today().isoformat()
+
+def _load_reset_state():
+    if not RESET_CLIENTS_STATE_FILE:
+        return {"last_reset_date": ""}
+    try:
+        if os.path.exists(RESET_CLIENTS_STATE_FILE):
+            with open(RESET_CLIENTS_STATE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return {
+                    "last_reset_date": clean_str(d.get("last_reset_date") or "")
+                }
+    except Exception:
+        pass
+    return {"last_reset_date": ""}
+
+def _save_reset_state(state: dict):
+    if not RESET_CLIENTS_STATE_FILE:
+        return
+    tmp = RESET_CLIENTS_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp, RESET_CLIENTS_STATE_FILE)
+
+def _can_reset_clients_today():
+    st = _load_reset_state()
+    today = _today_iso()
+    last = clean_str(st.get("last_reset_date") or "")
+    return last != today, last, today
 
 COUNTER = None
 
@@ -334,7 +369,6 @@ def _find_client_id_by_email_or_phone(email: str, phone: str, name: str = "") ->
 def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = "", name: str = "") -> str:
     cid = norm_client_id(incoming_id)
 
-    # IMPORTANTE:
     # Se vier ID da bridge, esse ID manda sempre.
     if cid:
         return cid
@@ -349,7 +383,6 @@ def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = 
 def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") -> str:
     cid = norm_client_id(client_id)
 
-    # IMPORTANTE:
     # Se vier client_id, usar esse ID diretamente.
     if cid:
         c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
@@ -404,6 +437,7 @@ def home():
         "uploads_dir": UPLOADS_DIR or "NO_UPLOADS",
         "bridge_pc_base": BRIDGE_PC_BASE or "",
         "render_external_url": clean_str(os.environ.get("RENDER_EXTERNAL_URL","") or ""),
+        "allow_multi_reset_same_day": bool(ALLOW_MULTI_RESET_SAME_DAY),
         "smtp": {
             "from": FROM_EMAIL,
             "host": SMTP_HOST,
@@ -1007,6 +1041,81 @@ def admin_client_get(cid):
         return bad("not found", 404)
     return jsonify({"ok": True, "item": c})
 
+@app.get("/admin/reset_clients_status")
+def admin_reset_clients_status():
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    allowed, last_reset_date, today = _can_reset_clients_today()
+
+    return jsonify({
+        "ok": True,
+        "allowed_today": bool(allowed or ALLOW_MULTI_RESET_SAME_DAY),
+        "last_reset_date": last_reset_date,
+        "today": today,
+        "override_enabled": bool(ALLOW_MULTI_RESET_SAME_DAY),
+        "clients_count": len(CLIENTS),
+    })
+
+@app.post("/admin/reset_clients")
+def admin_reset_clients():
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    allowed, last_reset_date, today = _can_reset_clients_today()
+    if not allowed and not ALLOW_MULTI_RESET_SAME_DAY:
+        return jsonify({
+            "ok": False,
+            "error": "reset_clients já foi usado hoje",
+            "last_reset_date": last_reset_date,
+            "today": today,
+        }), 429
+
+    data = request.get_json(silent=True) or {}
+    unlink_bookings = bool(data.get("unlink_bookings", False))
+    delete_uploads = bool(data.get("delete_uploads", False))
+
+    deleted_clients = len(CLIENTS)
+    unlinked = 0
+
+    CLIENTS.clear()
+
+    if unlink_bookings:
+        for bid, b in BOOKINGS.items():
+            if norm_client_id(b.get("client_id") or ""):
+                b["client_id"] = ""
+                b["client"] = ""
+                unlinked += 1
+        save_bookings()
+
+    if delete_uploads and UPLOADS_DIR:
+        try:
+            if os.path.isdir(UPLOADS_DIR):
+                shutil.rmtree(UPLOADS_DIR, ignore_errors=True)
+            os.makedirs(UPLOADS_DIR, exist_ok=True)
+        except Exception:
+            pass
+
+    save_clients()
+
+    global COUNTER
+    COUNTER = {"next": 1}
+    _save_counter(COUNTER)
+
+    _save_reset_state({
+        "last_reset_date": today
+    })
+
+    return jsonify({
+        "ok": True,
+        "deleted_clients": deleted_clients,
+        "bookings_unlinked": unlinked,
+        "uploads_reset": delete_uploads,
+        "next_client_id": 1,
+        "reset_date": today,
+        "override_enabled": bool(ALLOW_MULTI_RESET_SAME_DAY),
+    })
+
 @app.post("/admin/clients")
 def admin_clients_upsert():
     if not is_admin(request):
@@ -1022,7 +1131,6 @@ def admin_clients_upsert():
     age = clean_str(data.get("age") or "")
     notes = clean_str(data.get("notes") or "")
 
-    # IMPORTANTE:
     # se vier ID da bridge, nunca fundir com outro cliente por telefone/email/nome
     if incoming_id:
         cid = incoming_id
