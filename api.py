@@ -82,6 +82,13 @@ def norm_name(n: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def same_person_name(a: str, b: str) -> bool:
+    na = norm_name(a)
+    nb = norm_name(b)
+    if not na or not nb:
+        return False
+    return na == nb
+
 def merge_non_empty(dst: dict, src: dict):
     for k, v in (src or {}).items():
         if v is None:
@@ -369,7 +376,6 @@ def _find_client_id_by_email_or_phone(email: str, phone: str, name: str = "") ->
 def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = "", name: str = "") -> str:
     cid = norm_client_id(incoming_id)
 
-    # Se vier ID da bridge, esse ID manda sempre.
     if cid:
         return cid
 
@@ -380,14 +386,42 @@ def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = 
 
     return ""
 
-def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") -> str:
-    cid = norm_client_id(client_id)
+def _find_client_match_for_public_booking(name: str, phone: str, email: str) -> str:
+    """
+    Regras seguras para bookings da página pública:
+    - email exato => match
+    - telefone exato + nome igual => match
+    - nome sozinho => nunca
+    - telefone sozinho => nunca
+    """
+    e = norm_email(email)
+    p = norm_phone(phone)
+    nn = norm_name(name)
 
-    # Se vier client_id, usar esse ID diretamente.
+    if e:
+        for cid, c in CLIENTS.items():
+            if norm_email(c.get("email") or "") == e:
+                return str(cid)
+
+    if p and nn:
+        for cid, c in CLIENTS.items():
+            if norm_phone(c.get("phone") or "") == p and norm_name(c.get("name") or "") == nn:
+                return str(cid)
+
+    return ""
+
+def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", source: str = "") -> str:
+    cid = norm_client_id(client_id)
+    source = clean_str(source)
+
     if cid:
         c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     else:
-        hit = _find_client_id_by_email_or_phone(email, phone, name=name)
+        if source == "public_web":
+            hit = _find_client_match_for_public_booking(name, phone, email)
+        else:
+            hit = _find_client_id_by_email_or_phone(email, phone, name=name)
+
         hit = norm_client_id(hit)
         if hit and hit in CLIENTS:
             cid = hit
@@ -403,7 +437,25 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
     }
 
     c["id"] = cid
-    merge_non_empty(c, incoming)
+
+    # na página pública, se o cliente foi encontrado por email,
+    # só atualiza nome se estiver vazio ou se for o mesmo nome
+    if source == "public_web" and cid in CLIENTS:
+        old_name = clean_str(c.get("name") or "")
+        new_name = clean_str(incoming.get("name") or "")
+
+        if new_name:
+            if not old_name or same_person_name(old_name, new_name):
+                c["name"] = new_name
+
+        if incoming.get("phone"):
+            c["phone"] = incoming["phone"]
+
+        if incoming.get("email"):
+            c["email"] = incoming["email"]
+    else:
+        merge_non_empty(c, incoming)
+
     c["updated_at"] = int(time.time())
 
     CLIENTS[cid] = c
@@ -585,8 +637,15 @@ def book():
     phone = norm_phone(data.get("phone", ""))
     email = norm_email(data.get("email", ""))
     incoming_client_id = clean_str(data.get("client_id", ""))
+    created_via = clean_str(data.get("created_via", ""))
 
-    client_id = ensure_client_basic(name=name, phone=phone, email=email, client_id=incoming_client_id)
+    client_id = ensure_client_basic(
+        name=name,
+        phone=phone,
+        email=email,
+        client_id=incoming_client_id,
+        source=created_via
+    )
     c = CLIENTS.get(client_id) or {}
 
     item = {
@@ -605,7 +664,7 @@ def book():
         "client": clean_str(c.get("name") or name),
         "created_at": int(time.time()),
         "created_by": clean_str(data.get("created_by", "")),
-        "created_via": clean_str(data.get("created_via", "")),
+        "created_via": created_via,
     }
 
     BOOKINGS[bid] = item
@@ -741,7 +800,8 @@ def sync():
                     name=merged.get("name", ""),
                     phone=merged.get("phone", ""),
                     email=merged.get("email", ""),
-                    client_id=cid
+                    client_id=cid,
+                    source="bridge_sync"
                 )
                 cc = CLIENTS.get(cid) or {}
                 if clean_str(cc.get("name") or ""):
@@ -786,7 +846,8 @@ def replace_all():
                 name=b.get("name", ""),
                 phone=b.get("phone", ""),
                 email=b.get("email", ""),
-                client_id=cid
+                client_id=cid,
+                source="bridge_replace_all"
             )
             cc = CLIENTS.get(cid) or {}
             if clean_str(cc.get("name") or ""):
@@ -1131,7 +1192,6 @@ def admin_clients_upsert():
     age = clean_str(data.get("age") or "")
     notes = clean_str(data.get("notes") or "")
 
-    # se vier ID da bridge, nunca fundir com outro cliente por telefone/email/nome
     if incoming_id:
         cid = incoming_id
     else:
