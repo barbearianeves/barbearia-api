@@ -333,7 +333,10 @@ def _find_client_id_by_email_or_phone(email: str, phone: str, name: str = "") ->
 
 def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = "", name: str = "") -> str:
     cid = norm_client_id(incoming_id)
-    if cid and cid in CLIENTS:
+
+    # IMPORTANTE:
+    # Se vier ID da bridge, esse ID manda sempre.
+    if cid:
         return cid
 
     hit = _find_client_id_by_email_or_phone(email, phone, name=name)
@@ -346,7 +349,9 @@ def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = 
 def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") -> str:
     cid = norm_client_id(client_id)
 
-    if cid and cid in CLIENTS:
+    # IMPORTANTE:
+    # Se vier client_id, usar esse ID diretamente.
+    if cid:
         c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     else:
         hit = _find_client_id_by_email_or_phone(email, phone, name=name)
@@ -1017,10 +1022,14 @@ def admin_clients_upsert():
     age = clean_str(data.get("age") or "")
     notes = clean_str(data.get("notes") or "")
 
-    cid = _find_existing_client_for_upsert(email, phone, incoming_id=incoming_id, name=name)
-
-    if not cid:
-        cid = incoming_id if incoming_id else _next_client_id_str()
+    # IMPORTANTE:
+    # se vier ID da bridge, nunca fundir com outro cliente por telefone/email/nome
+    if incoming_id:
+        cid = incoming_id
+    else:
+        cid = _find_existing_client_for_upsert(email, phone, incoming_id="", name=name)
+        if not cid:
+            cid = _next_client_id_str()
 
     c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     c["id"] = cid
