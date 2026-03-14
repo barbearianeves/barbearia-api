@@ -516,13 +516,15 @@ def book():
         "client_id": client_id,
         "client": client_name or "",
         "created_at": int(time.time()),
+        "created_by": clean_str(data.get("created_by", "")),
+        "created_via": clean_str(data.get("created_via", "")),
     }
 
     BOOKINGS[bid] = item
     save_bookings()
     push_change("upsert", item)
 
-    return jsonify({"ok": True, "id": bid, "client_id": client_id})
+    return jsonify({"ok": True, "id": bid, "client_id": client_id, "item": item})
 
 # =========================
 # CLIENTE: VER / CANCELAR
@@ -558,6 +560,8 @@ def my_bookings():
             "notes": clean_str(b.get("notes", "")),
             "client_id": norm_client_id(b.get("client_id", "")),
             "client": clean_str(b.get("client", "")),
+            "created_by": clean_str(b.get("created_by", "")),
+            "created_via": clean_str(b.get("created_via", "")),
         })
 
     out.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
@@ -729,6 +733,13 @@ def _day_items_for_clients(date_: str = "", barber: str = ""):
             "label": "INDISPONÍVEL" if is_block else "OCUPADO",
             "service": clean_str(b.get("service", "")),
             "notes": clean_str(b.get("notes", "")),
+            "name": clean_str(b.get("name", "")),
+            "client": clean_str(b.get("client", "")),
+            "phone": norm_phone(b.get("phone", "")),
+            "email": norm_email(b.get("email", "")),
+            "client_id": norm_client_id(b.get("client_id", "")),
+            "created_by": clean_str(b.get("created_by", "")),
+            "created_via": clean_str(b.get("created_via", "")),
         })
     return out
 
@@ -815,6 +826,8 @@ def admin_block():
         "client_id": "",
         "client": "INDISPONÍVEL",
         "created_at": int(time.time()),
+        "created_by": "",
+        "created_via": "",
     }
 
     BOOKINGS[bid] = item
