@@ -301,13 +301,109 @@ def _find_client_id_by_email_or_phone(email: str, phone: str) -> str:
                 return str(cid)
     return ""
 
+def client_has_photo(c: dict) -> bool:
+    return bool(clean_str(c.get("photo_before_url") or "") or clean_str(c.get("photo_after_url") or ""))
+
+def _find_client_id_by_email_phone_or_unique_name(email: str, phone: str, name: str) -> str:
+    e = norm_email(email or "")
+    p = norm_phone(phone or "")
+    n = clean_str(name or "")
+
+    if e:
+        for cid, c in CLIENTS.items():
+            if norm_email(c.get("email") or "") == e:
+                return str(cid)
+
+    if p:
+        for cid, c in CLIENTS.items():
+            if norm_phone(c.get("phone") or "") == p:
+                return str(cid)
+
+    if n:
+        hits = []
+        nn = n.lower()
+        for cid, c in CLIENTS.items():
+            if clean_str(c.get("name") or "").lower() == nn:
+                hits.append(str(cid))
+        if len(hits) == 1:
+            return hits[0]
+
+    return ""
+
+def client_identity_key(c: dict) -> str:
+    email = norm_email(c.get("email") or "")
+    phone = norm_phone(c.get("phone") or "")
+    name = clean_str(c.get("name") or "").lower()
+
+    if email:
+        return "e:" + email
+    if phone:
+        return "p:" + phone
+    if name:
+        return "n:" + name
+    return "id:" + str(c.get("id") or "")
+
+def choose_better_client(a: dict, b: dict) -> dict:
+    if not a:
+        return b
+    if not b:
+        return a
+
+    a_photo = 1 if client_has_photo(a) else 0
+    b_photo = 1 if client_has_photo(b) else 0
+    if a_photo != b_photo:
+        return a if a_photo > b_photo else b
+
+    a_upd = int(a.get("updated_at") or 0)
+    b_upd = int(b.get("updated_at") or 0)
+    if a_upd != b_upd:
+        return a if a_upd > b_upd else b
+
+    a_created = int(a.get("created_at") or 0)
+    b_created = int(b.get("created_at") or 0)
+    if a_created != b_created:
+        return a if a_created > b_created else b
+
+    a_id = norm_client_id(a.get("id") or "")
+    b_id = norm_client_id(b.get("id") or "")
+    if a_id and b_id:
+        return a if int(a_id) < int(b_id) else b
+
+    return a
+
+def deduped_clients_for_admin():
+    chosen = {}
+
+    for cid, c in CLIENTS.items():
+        item = dict(c)
+        item["id"] = norm_client_id(item.get("id") or cid) or str(cid)
+
+        key = client_identity_key(item)
+        if key not in chosen:
+            chosen[key] = item
+        else:
+            chosen[key] = choose_better_client(chosen[key], item)
+
+    items = list(chosen.values())
+
+    def _k(x):
+        sid = clean_str(x.get("id", ""))
+        return (
+            clean_str(x.get("name", "")).lower(),
+            int(sid) if sid.isdigit() else 10**18,
+            sid,
+        )
+
+    items.sort(key=_k)
+    return items
+
 def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") -> str:
     cid = norm_client_id(client_id)
 
     if cid and cid in CLIENTS:
         c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     else:
-        hit = _find_client_id_by_email_or_phone(email, phone)
+        hit = _find_client_id_by_email_phone_or_unique_name(email, phone, name)
         hit = norm_client_id(hit)
         if hit and hit in CLIENTS:
             cid = hit
@@ -406,12 +502,12 @@ def bridge_clients():
         return bad("unauthorized", 401)
 
     items = []
-    for cid, c in CLIENTS.items():
+    for c in deduped_clients_for_admin():
         before_u = clean_str(c.get("photo_before_url") or "")
         after_u  = clean_str(c.get("photo_after_url") or "")
 
         items.append({
-            "id": str(c.get("id") or cid),
+            "id": str(c.get("id") or ""),
             "name": clean_str(c.get("name") or ""),
             "phone": norm_phone(c.get("phone") or ""),
             "email": norm_email(c.get("email") or ""),
@@ -909,7 +1005,7 @@ def admin_clients_list():
         return bad("unauthorized", 401)
 
     q = clean_str(request.args.get("q") or "").lower()
-    items = list(CLIENTS.values())
+    items = deduped_clients_for_admin()
 
     if q:
         def hit(c):
@@ -921,11 +1017,6 @@ def admin_clients_list():
             )
         items = [c for c in items if hit(c)]
 
-    def _k(x):
-        sid = clean_str(x.get("id",""))
-        return (x.get("name",""), int(sid) if sid.isdigit() else 10**18, sid)
-
-    items.sort(key=_k)
     return jsonify({"ok": True, "items": items})
 
 @app.get("/admin/client/<cid>")
@@ -955,7 +1046,7 @@ def admin_clients_upsert():
 
     cid = incoming_id
     if not cid:
-        hit = _find_client_id_by_email_or_phone(email, phone)
+        hit = _find_client_id_by_email_phone_or_unique_name(email, phone, name)
         hit = norm_client_id(hit)
         if hit:
             cid = hit
