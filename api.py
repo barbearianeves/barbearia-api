@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from collections import deque
 from datetime import date
-import os, time, secrets, json, shutil, re
+import os, time, secrets, json, shutil, re, unicodedata
 
 import smtplib, ssl, socket
 from email.mime.text import MIMEText
@@ -72,6 +72,24 @@ def norm_client_id(cid: str) -> str:
         n = int(s)
         return str(n) if n > 0 else ""
     return ""
+
+def norm_name(n: str) -> str:
+    s = clean_str(n).lower()
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def merge_non_empty(dst: dict, src: dict):
+    for k, v in (src or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not clean_str(v):
+            continue
+        dst[k] = v
+    return dst
 
 def _guess_base_url():
     base = clean_str(os.environ.get("RENDER_EXTERNAL_URL", "") or "")
@@ -288,25 +306,37 @@ def _next_client_id_str():
     _save_counter(COUNTER)
     return str(cid)
 
-def _find_client_id_by_email_or_phone(email: str, phone: str) -> str:
+def _find_client_id_by_email_or_phone(email: str, phone: str, name: str = "") -> str:
     e = norm_email(email or "")
     p = norm_phone(phone or "")
+    nn = norm_name(name or "")
+
     if e:
         for cid, c in CLIENTS.items():
             if norm_email(c.get("email") or "") == e:
                 return str(cid)
+
     if p:
         for cid, c in CLIENTS.items():
             if norm_phone(c.get("phone") or "") == p:
                 return str(cid)
+
+    if nn:
+        hits = []
+        for cid, c in CLIENTS.items():
+            if norm_name(c.get("name") or "") == nn:
+                hits.append(str(cid))
+        if len(hits) == 1:
+            return hits[0]
+
     return ""
 
-def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = "") -> str:
+def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = "", name: str = "") -> str:
     cid = norm_client_id(incoming_id)
     if cid and cid in CLIENTS:
         return cid
 
-    hit = _find_client_id_by_email_or_phone(email, phone)
+    hit = _find_client_id_by_email_or_phone(email, phone, name=name)
     hit = norm_client_id(hit)
     if hit and hit in CLIENTS:
         return hit
@@ -319,7 +349,7 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
     if cid and cid in CLIENTS:
         c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     else:
-        hit = _find_client_id_by_email_or_phone(email, phone)
+        hit = _find_client_id_by_email_or_phone(email, phone, name=name)
         hit = norm_client_id(hit)
         if hit and hit in CLIENTS:
             cid = hit
@@ -328,18 +358,16 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "") 
             cid = _next_client_id_str()
             c = {"id": cid, "created_at": int(time.time())}
 
-    name = clean_str(name)
-    phone = norm_phone(phone or "")
-    email = norm_email(email or "")
+    incoming = {
+        "name": clean_str(name),
+        "phone": norm_phone(phone or ""),
+        "email": norm_email(email or ""),
+    }
 
-    if name:
-        c["name"] = name
-    if phone:
-        c["phone"] = phone
-    if email:
-        c["email"] = email
-
+    c["id"] = cid
+    merge_non_empty(c, incoming)
     c["updated_at"] = int(time.time())
+
     CLIENTS[cid] = c
     save_clients()
     _recalc_counter_from_clients()
@@ -520,17 +548,13 @@ def book():
     incoming_client_id = clean_str(data.get("client_id", ""))
 
     client_id = ensure_client_basic(name=name, phone=phone, email=email, client_id=incoming_client_id)
-
-    client_name = name
-    c = CLIENTS.get(client_id)
-    if c and clean_str(c.get("name") or ""):
-        client_name = c.get("name")
+    c = CLIENTS.get(client_id) or {}
 
     item = {
         "id": bid,
-        "name": name,
-        "phone": phone,
-        "email": email,
+        "name": clean_str(c.get("name") or name),
+        "phone": norm_phone(c.get("phone") or phone),
+        "email": norm_email(c.get("email") or email),
         "service": clean_str(data.get("service", "")),
         "barber": clean_str(data.get("barber", "")),
         "date": clean_str(data.get("date", "")),
@@ -539,7 +563,7 @@ def book():
         "notes": clean_str(data.get("notes", "")),
         "status": "Marcado",
         "client_id": client_id,
-        "client": client_name or "",
+        "client": clean_str(c.get("name") or name),
         "created_at": int(time.time()),
         "created_by": clean_str(data.get("created_by", "")),
         "created_via": clean_str(data.get("created_via", "")),
@@ -667,24 +691,32 @@ def sync():
             applied += 1
 
         elif op == "upsert":
-            BOOKINGS[bid] = {**BOOKINGS.get(bid, {}), **payload}
-            BOOKINGS[bid]["client_id"] = norm_client_id(BOOKINGS[bid].get("client_id") or "")
+            current = BOOKINGS.get(bid, {})
+            merged = {**current, **payload}
+
+            cid = norm_client_id(merged.get("client_id") or "")
+            merged["client_id"] = cid
+
+            if cid:
+                ensure_client_basic(
+                    name=merged.get("name", ""),
+                    phone=merged.get("phone", ""),
+                    email=merged.get("email", ""),
+                    client_id=cid
+                )
+                cc = CLIENTS.get(cid) or {}
+                if clean_str(cc.get("name") or ""):
+                    merged["name"] = clean_str(cc.get("name") or merged.get("name") or "")
+                    merged["client"] = clean_str(cc.get("name") or "")
+                if clean_str(cc.get("phone") or ""):
+                    merged["phone"] = norm_phone(cc.get("phone") or "")
+                if clean_str(cc.get("email") or ""):
+                    merged["email"] = norm_email(cc.get("email") or "")
+
+            BOOKINGS[bid] = merged
             save_bookings()
             push_change("upsert", BOOKINGS[bid])
             applied += 1
-
-            cid = norm_client_id(BOOKINGS[bid].get("client_id") or "")
-            if cid:
-                ensure_client_basic(
-                    name=BOOKINGS[bid].get("name", ""),
-                    phone=BOOKINGS[bid].get("phone", ""),
-                    email=BOOKINGS[bid].get("email", ""),
-                    client_id=cid
-                )
-                cc = CLIENTS.get(cid)
-                if cc and clean_str(cc.get("name") or ""):
-                    BOOKINGS[bid]["client"] = cc.get("name") or ""
-                    save_bookings()
 
     return jsonify({"ok": True, "applied": applied})
 
@@ -717,9 +749,16 @@ def replace_all():
                 email=b.get("email", ""),
                 client_id=cid
             )
-            cc = CLIENTS.get(cid)
-            if cc and clean_str(cc.get("name") or ""):
-                b["client"] = cc.get("name") or ""
+            cc = CLIENTS.get(cid) or {}
+            if clean_str(cc.get("name") or ""):
+                b["name"] = clean_str(cc.get("name") or b.get("name") or "")
+                b["client"] = clean_str(cc.get("name") or "")
+            else:
+                b["client"] = clean_str(b.get("client") or "")
+            if clean_str(cc.get("phone") or ""):
+                b["phone"] = norm_phone(cc.get("phone") or "")
+            if clean_str(cc.get("email") or ""):
+                b["email"] = norm_email(cc.get("email") or "")
         else:
             b["client"] = clean_str(b.get("client") or "")
 
@@ -978,26 +1017,28 @@ def admin_clients_upsert():
     age = clean_str(data.get("age") or "")
     notes = clean_str(data.get("notes") or "")
 
-    cid = _find_existing_client_for_upsert(email, phone, incoming_id=incoming_id)
+    cid = _find_existing_client_for_upsert(email, phone, incoming_id=incoming_id, name=name)
 
     if not cid:
-        if incoming_id:
-            cid = incoming_id
-        else:
-            cid = _next_client_id_str()
+        cid = incoming_id if incoming_id else _next_client_id_str()
 
     c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
-
     c["id"] = cid
-    c["name"] = name
-    c["phone"] = phone
-    c["email"] = email
-    c["profession"] = profession
-    c["age"] = age
-    c["notes"] = notes
+
+    incoming = {
+        "name": name,
+        "phone": phone,
+        "email": email,
+        "profession": profession,
+        "age": age,
+        "notes": notes,
+    }
+
+    merge_non_empty(c, incoming)
 
     if data.get("photo_before_url") is not None:
         c["photo_before_url"] = clean_str(data.get("photo_before_url") or "")
+
     if data.get("photo_after_url") is not None:
         c["photo_after_url"] = clean_str(data.get("photo_after_url") or "")
 
