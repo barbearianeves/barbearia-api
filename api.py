@@ -61,6 +61,10 @@ def norm_phone(p: str) -> str:
         digits = digits[3:]
     return digits
 
+def valid_pt_mobile_phone(p: str) -> bool:
+    p = norm_phone(p)
+    return bool(re.fullmatch(r"9\d{8}", p))
+
 def norm_email(e: str) -> str:
     return clean_str(e).lower()
 
@@ -362,15 +366,6 @@ def _next_client_id_str():
     _save_counter(COUNTER)
     return str(new_id)
 
-def _find_client_by_email(email: str) -> str:
-    e = norm_email(email or "")
-    if not e:
-        return ""
-    for cid, c in CLIENTS.items():
-        if norm_email(c.get("email") or "") == e:
-            return str(cid)
-    return ""
-
 def _find_client_by_phone(phone: str) -> str:
     p = norm_phone(phone or "")
     if not p:
@@ -378,27 +373,6 @@ def _find_client_by_phone(phone: str) -> str:
     for cid, c in CLIENTS.items():
         if norm_phone(c.get("phone") or "") == p:
             return str(cid)
-    return ""
-
-def _find_duplicate_client_strict(email: str, phone: str, name: str = "") -> str:
-    e = norm_email(email or "")
-    p = norm_phone(phone or "")
-    n = norm_name(name or "")
-
-    for cid, c in CLIENTS.items():
-        ce = norm_email(c.get("email") or "")
-        cp = norm_phone(c.get("phone") or "")
-        cn = norm_name(c.get("name") or "")
-
-        if e and ce and e == ce:
-            return str(cid)
-
-        if p and cp and p == cp:
-            return str(cid)
-
-        if e and p and n and ce == e and cp == p and cn == n:
-            return str(cid)
-
     return ""
 
 def _safe_set_contact_field(dst: dict, field: str, new_value: str):
@@ -440,36 +414,27 @@ def _safe_set_name(dst: dict, new_name: str):
 
 def _find_client_match_for_public_booking(name: str, phone: str, email: str) -> str:
     """
-    Regras seguras para bookings públicos:
-    - email exato => match
-    - telefone exato + nome igual => match
+    Regras seguras:
+    - telefone exato => match
     - nome sozinho => nunca
-    - telefone sozinho => nunca
+    - email sozinho => nunca
     """
-    e = norm_email(email)
     p = norm_phone(phone)
-    nn = norm_name(name)
-
-    if e:
-        hit = _find_client_by_email(e)
+    if p and valid_pt_mobile_phone(p):
+        hit = _find_client_by_phone(p)
         if hit:
             return hit
-
-    if p and nn:
-        for cid, c in CLIENTS.items():
-            if norm_phone(c.get("phone") or "") == p and norm_name(c.get("name") or "") == nn:
-                return str(cid)
-
     return ""
 
 def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", source: str = "") -> str:
     """
     Regras:
+    - telefone é obrigatório e é a chave principal
     - se vier client_id válido -> usa esse cliente
-    - public_web -> match seguro por email ou telefone+nome
-    - outros fluxos -> só match estrito por email/telefone/3campos
-    - nunca faz match por nome sozinho
-    - nunca substitui phone/email existentes por valores diferentes
+    - sem client_id -> tenta match APENAS por telefone válido
+    - nunca faz match por nome
+    - nunca faz match por email
+    - nunca substitui telefone existente por outro diferente
     """
     cid = norm_client_id(client_id)
     source = clean_str(source)
@@ -477,6 +442,9 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", 
     incoming_name = clean_str(name)
     incoming_phone = norm_phone(phone or "")
     incoming_email = norm_email(email or "")
+
+    if not valid_pt_mobile_phone(incoming_phone):
+        raise ValueError("telefone inválido: deve ter 9 dígitos e começar por 9")
 
     if cid and cid in CLIENTS:
         c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
@@ -486,7 +454,7 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", 
         if source == "public_web":
             hit = _find_client_match_for_public_booking(incoming_name, incoming_phone, incoming_email)
         else:
-            hit = _find_duplicate_client_strict(incoming_email, incoming_phone, name=incoming_name)
+            hit = _find_client_by_phone(incoming_phone)
 
         hit = norm_client_id(hit)
         if hit and hit in CLIENTS:
@@ -497,11 +465,9 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", 
             c = {"id": cid, "created_at": int(time.time())}
 
     c["id"] = cid
-
     _safe_set_name(c, incoming_name)
     _safe_set_contact_field(c, "phone", incoming_phone)
     _safe_set_contact_field(c, "email", incoming_email)
-
     c["updated_at"] = int(time.time())
 
     CLIENTS[cid] = c
@@ -685,18 +651,26 @@ def book():
     incoming_client_id = norm_client_id(data.get("client_id", ""))
     created_via = clean_str(data.get("created_via", ""))
 
-    if incoming_client_id and incoming_client_id in CLIENTS:
-        client_id = incoming_client_id
-    else:
-        client_id = ensure_client_basic(
-            name=name,
-            phone=phone,
-            email=email,
-            client_id="",
-            source=created_via
-        )
+    if not valid_pt_mobile_phone(phone):
+        return bad("Telefone inválido: deve ter 9 dígitos e começar por 9", 400)
 
-    c = CLIENTS.get(client_id) or {}
+    try:
+        if incoming_client_id and incoming_client_id in CLIENTS:
+            client_id = incoming_client_id
+            c = CLIENTS.get(client_id) or {}
+            if norm_phone(c.get("phone") or "") != phone:
+                return bad("Telefone não corresponde ao cliente indicado", 409)
+        else:
+            client_id = ensure_client_basic(
+                name=name,
+                phone=phone,
+                email=email,
+                client_id="",
+                source=created_via
+            )
+            c = CLIENTS.get(client_id) or {}
+    except ValueError as e:
+        return bad(str(e), 400)
 
     booking_name = clean_str(c.get("name") or name)
     booking_phone = norm_phone(c.get("phone") or phone)
@@ -735,6 +709,8 @@ def my_bookings():
     phone = norm_phone(request.args.get("phone", ""))
     if not phone:
         return bad("Telefone em falta")
+    if not valid_pt_mobile_phone(phone):
+        return bad("Telefone inválido")
 
     today_iso = date.today().isoformat()
     out = []
@@ -779,6 +755,8 @@ def cancel_booking():
         return bad("ID em falta")
     if not phone:
         return bad("Telefone em falta")
+    if not valid_pt_mobile_phone(phone):
+        return bad("Telefone inválido")
 
     b = BOOKINGS.get(bid)
     if not b:
@@ -1089,6 +1067,12 @@ def admin_link_client(bid):
     if not cid or cid not in CLIENTS:
         return bad("cliente não encontrado", 404)
 
+    current_phone = norm_phone(BOOKINGS[bid].get("phone") or "")
+    client_phone = norm_phone(CLIENTS[cid].get("phone") or "")
+
+    if current_phone and client_phone and current_phone != client_phone:
+        return bad("não é possível ligar booking a cliente com telefone diferente", 409)
+
     BOOKINGS[bid]["client_id"] = cid
 
     c = CLIENTS.get(cid) or {}
@@ -1232,12 +1216,27 @@ def admin_clients_upsert():
     age = clean_str(data.get("age") or "")
     notes = clean_str(data.get("notes") or "")
 
+    if not phone:
+        return bad("telefone é obrigatório", 400)
+
+    if not valid_pt_mobile_phone(phone):
+        return bad("telefone inválido: deve ter 9 dígitos e começar por 9", 400)
+
     created = False
 
     if incoming_id:
         cid = incoming_id
+        c = CLIENTS.get(cid)
+        if not c:
+            return bad("cliente não encontrado", 404)
+
+        existing_phone = norm_phone(c.get("phone") or "")
+        if existing_phone and existing_phone != phone:
+            other_cid = _find_client_by_phone(phone)
+            if other_cid and other_cid != cid:
+                return bad("já existe outro cliente com esse telefone", 409)
     else:
-        dup_id = _find_duplicate_client_strict(email, phone, name=name)
+        dup_id = _find_client_by_phone(phone)
         if dup_id:
             existing = CLIENTS.get(dup_id) or {}
             return jsonify({
@@ -1249,11 +1248,10 @@ def admin_clients_upsert():
             }), 409
 
         cid = _next_client_id_str()
+        c = {"id": cid, "created_at": int(time.time())}
         created = True
 
-    c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     c["id"] = cid
-
     _safe_set_name(c, name)
     _safe_set_contact_field(c, "phone", phone)
     _safe_set_contact_field(c, "email", email)
