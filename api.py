@@ -15,7 +15,7 @@ from email.mime.multipart import MIMEMultipart
 import requests
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}}, allow_headers=["Content-Type", "X-Admin-Token"])
 
 # =========================
 # CONFIG / SECRETS
@@ -362,47 +362,85 @@ def _next_client_id_str():
     _save_counter(COUNTER)
     return str(new_id)
 
-def _find_client_id_by_email_or_phone(email: str, phone: str, name: str = "") -> str:
+def _find_client_by_email(email: str) -> str:
+    e = norm_email(email or "")
+    if not e:
+        return ""
+    for cid, c in CLIENTS.items():
+        if norm_email(c.get("email") or "") == e:
+            return str(cid)
+    return ""
+
+def _find_client_by_phone(phone: str) -> str:
+    p = norm_phone(phone or "")
+    if not p:
+        return ""
+    for cid, c in CLIENTS.items():
+        if norm_phone(c.get("phone") or "") == p:
+            return str(cid)
+    return ""
+
+def _find_duplicate_client_strict(email: str, phone: str, name: str = "") -> str:
     e = norm_email(email or "")
     p = norm_phone(phone or "")
-    nn = norm_name(name or "")
+    n = norm_name(name or "")
 
-    if e:
-        for cid, c in CLIENTS.items():
-            if norm_email(c.get("email") or "") == e:
-                return str(cid)
+    for cid, c in CLIENTS.items():
+        ce = norm_email(c.get("email") or "")
+        cp = norm_phone(c.get("phone") or "")
+        cn = norm_name(c.get("name") or "")
 
-    if p:
-        for cid, c in CLIENTS.items():
-            if norm_phone(c.get("phone") or "") == p:
-                return str(cid)
+        if e and ce and e == ce:
+            return str(cid)
 
-    if nn:
-        hits = []
-        for cid, c in CLIENTS.items():
-            if norm_name(c.get("name") or "") == nn:
-                hits.append(str(cid))
-        if len(hits) == 1:
-            return hits[0]
+        if p and cp and p == cp:
+            return str(cid)
+
+        if e and p and n and ce == e and cp == p and cn == n:
+            return str(cid)
 
     return ""
 
-def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = "", name: str = "") -> str:
-    cid = norm_client_id(incoming_id)
+def _safe_set_contact_field(dst: dict, field: str, new_value: str):
+    nv = clean_str(new_value or "")
+    if field == "phone":
+        nv = norm_phone(nv)
+    elif field == "email":
+        nv = norm_email(nv)
 
-    if cid:
-        return cid
+    if not nv:
+        return
 
-    hit = _find_client_id_by_email_or_phone(email, phone, name=name)
-    hit = norm_client_id(hit)
-    if hit and hit in CLIENTS:
-        return hit
+    cur = clean_str(dst.get(field) or "")
+    if field == "phone":
+        cur = norm_phone(cur)
+    elif field == "email":
+        cur = norm_email(cur)
 
-    return ""
+    if not cur:
+        dst[field] = nv
+        return
+
+    if cur == nv:
+        dst[field] = nv
+        return
+
+def _safe_set_name(dst: dict, new_name: str):
+    nn = clean_str(new_name or "")
+    if not nn:
+        return
+
+    cur = clean_str(dst.get("name") or "")
+    if not cur:
+        dst["name"] = nn
+        return
+
+    if same_person_name(cur, nn):
+        dst["name"] = nn
 
 def _find_client_match_for_public_booking(name: str, phone: str, email: str) -> str:
     """
-    Regras seguras para bookings da página pública:
+    Regras seguras para bookings públicos:
     - email exato => match
     - telefone exato + nome igual => match
     - nome sozinho => nunca
@@ -413,9 +451,9 @@ def _find_client_match_for_public_booking(name: str, phone: str, email: str) -> 
     nn = norm_name(name)
 
     if e:
-        for cid, c in CLIENTS.items():
-            if norm_email(c.get("email") or "") == e:
-                return str(cid)
+        hit = _find_client_by_email(e)
+        if hit:
+            return hit
 
     if p and nn:
         for cid, c in CLIENTS.items():
@@ -425,16 +463,30 @@ def _find_client_match_for_public_booking(name: str, phone: str, email: str) -> 
     return ""
 
 def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", source: str = "") -> str:
+    """
+    Regras:
+    - se vier client_id válido -> usa esse cliente
+    - public_web -> match seguro por email ou telefone+nome
+    - outros fluxos -> só match estrito por email/telefone/3campos
+    - nunca faz match por nome sozinho
+    - nunca substitui phone/email existentes por valores diferentes
+    """
     cid = norm_client_id(client_id)
     source = clean_str(source)
 
-    if cid:
+    incoming_name = clean_str(name)
+    incoming_phone = norm_phone(phone or "")
+    incoming_email = norm_email(email or "")
+
+    if cid and cid in CLIENTS:
         c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     else:
+        cid = ""
+
         if source == "public_web":
-            hit = _find_client_match_for_public_booking(name, phone, email)
+            hit = _find_client_match_for_public_booking(incoming_name, incoming_phone, incoming_email)
         else:
-            hit = _find_client_id_by_email_or_phone(email, phone, name=name)
+            hit = _find_duplicate_client_strict(incoming_email, incoming_phone, name=incoming_name)
 
         hit = norm_client_id(hit)
         if hit and hit in CLIENTS:
@@ -444,31 +496,11 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", 
             cid = _next_client_id_str()
             c = {"id": cid, "created_at": int(time.time())}
 
-    incoming = {
-        "name": clean_str(name),
-        "phone": norm_phone(phone or ""),
-        "email": norm_email(email or ""),
-    }
-
     c["id"] = cid
 
-    # na página pública, se encontrou por email,
-    # não estraga o nome antigo com outro nome errado
-    if source == "public_web" and cid in CLIENTS:
-        old_name = clean_str(c.get("name") or "")
-        new_name = clean_str(incoming.get("name") or "")
-
-        if new_name:
-            if not old_name or same_person_name(old_name, new_name):
-                c["name"] = new_name
-
-        if incoming.get("phone"):
-            c["phone"] = incoming["phone"]
-
-        if incoming.get("email"):
-            c["email"] = incoming["email"]
-    else:
-        merge_non_empty(c, incoming)
+    _safe_set_name(c, incoming_name)
+    _safe_set_contact_field(c, "phone", incoming_phone)
+    _safe_set_contact_field(c, "email", incoming_email)
 
     c["updated_at"] = int(time.time())
 
@@ -650,23 +682,31 @@ def book():
     name = clean_str(data.get("name", ""))
     phone = norm_phone(data.get("phone", ""))
     email = norm_email(data.get("email", ""))
-    incoming_client_id = clean_str(data.get("client_id", ""))
+    incoming_client_id = norm_client_id(data.get("client_id", ""))
     created_via = clean_str(data.get("created_via", ""))
 
-    client_id = ensure_client_basic(
-        name=name,
-        phone=phone,
-        email=email,
-        client_id=incoming_client_id,
-        source=created_via
-    )
+    if incoming_client_id and incoming_client_id in CLIENTS:
+        client_id = incoming_client_id
+    else:
+        client_id = ensure_client_basic(
+            name=name,
+            phone=phone,
+            email=email,
+            client_id="",
+            source=created_via
+        )
+
     c = CLIENTS.get(client_id) or {}
+
+    booking_name = clean_str(c.get("name") or name)
+    booking_phone = norm_phone(c.get("phone") or phone)
+    booking_email = norm_email(c.get("email") or email)
 
     item = {
         "id": bid,
-        "name": clean_str(c.get("name") or name),
-        "phone": norm_phone(c.get("phone") or phone),
-        "email": norm_email(c.get("email") or email),
+        "name": booking_name,
+        "phone": booking_phone,
+        "email": booking_email,
         "service": clean_str(data.get("service", "")),
         "barber": clean_str(data.get("barber", "")),
         "date": clean_str(data.get("date", "")),
@@ -675,7 +715,7 @@ def book():
         "notes": clean_str(data.get("notes", "")),
         "status": "Marcado",
         "client_id": client_id,
-        "client": clean_str(c.get("name") or name),
+        "client": booking_name,
         "created_at": int(time.time()),
         "created_by": clean_str(data.get("created_by", "")),
         "created_via": created_via,
@@ -809,14 +849,7 @@ def sync():
             cid = norm_client_id(merged.get("client_id") or "")
             merged["client_id"] = cid
 
-            if cid:
-                ensure_client_basic(
-                    name=merged.get("name", ""),
-                    phone=merged.get("phone", ""),
-                    email=merged.get("email", ""),
-                    client_id=cid,
-                    source="bridge_sync"
-                )
+            if cid and cid in CLIENTS:
                 cc = CLIENTS.get(cid) or {}
                 if clean_str(cc.get("name") or ""):
                     merged["name"] = clean_str(cc.get("name") or merged.get("name") or "")
@@ -855,14 +888,7 @@ def replace_all():
         cid = norm_client_id(b.get("client_id") or "")
         b["client_id"] = cid
 
-        if cid:
-            ensure_client_basic(
-                name=b.get("name", ""),
-                phone=b.get("phone", ""),
-                email=b.get("email", ""),
-                client_id=cid,
-                source="bridge_replace_all"
-            )
+        if cid and cid in CLIENTS:
             cc = CLIENTS.get(cid) or {}
             if clean_str(cc.get("name") or ""):
                 b["name"] = clean_str(cc.get("name") or b.get("name") or "")
@@ -1036,7 +1062,7 @@ def admin_validate_and_email(bid):
 
     incoming_email = clean_str(data.get("email") or "")
     if incoming_email:
-        BOOKINGS[bid]["email"] = incoming_email
+        BOOKINGS[bid]["email"] = norm_email(incoming_email)
 
     BOOKINGS[bid]["status"] = new_status
     save_bookings()
@@ -1064,15 +1090,15 @@ def admin_link_client(bid):
         return bad("cliente não encontrado", 404)
 
     BOOKINGS[bid]["client_id"] = cid
-    BOOKINGS[bid]["client"] = clean_str(CLIENTS[cid].get("name") or "")
 
     c = CLIENTS.get(cid) or {}
+    if clean_str(c.get("name") or ""):
+        BOOKINGS[bid]["client"] = clean_str(c.get("name") or "")
+        BOOKINGS[bid]["name"] = clean_str(c.get("name") or "")
     if clean_str(c.get("phone") or ""):
         BOOKINGS[bid]["phone"] = norm_phone(c.get("phone") or "")
     if clean_str(c.get("email") or ""):
         BOOKINGS[bid]["email"] = norm_email(c.get("email") or "")
-    if clean_str(c.get("name") or ""):
-        BOOKINGS[bid]["name"] = clean_str(c.get("name") or "")
 
     save_bookings()
     push_change("upsert", BOOKINGS[bid])
@@ -1206,26 +1232,38 @@ def admin_clients_upsert():
     age = clean_str(data.get("age") or "")
     notes = clean_str(data.get("notes") or "")
 
+    created = False
+
     if incoming_id:
         cid = incoming_id
     else:
-        cid = _find_existing_client_for_upsert(email, phone, incoming_id="", name=name)
-        if not cid:
-            cid = _next_client_id_str()
+        dup_id = _find_duplicate_client_strict(email, phone, name=name)
+        if dup_id:
+            existing = CLIENTS.get(dup_id) or {}
+            return jsonify({
+                "ok": False,
+                "error": "cliente duplicado",
+                "duplicate": True,
+                "id": dup_id,
+                "item": existing,
+            }), 409
+
+        cid = _next_client_id_str()
+        created = True
 
     c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
     c["id"] = cid
 
-    incoming = {
-        "name": name,
-        "phone": phone,
-        "email": email,
-        "profession": profession,
-        "age": age,
-        "notes": notes,
-    }
+    _safe_set_name(c, name)
+    _safe_set_contact_field(c, "phone", phone)
+    _safe_set_contact_field(c, "email", email)
 
-    merge_non_empty(c, incoming)
+    if profession:
+        c["profession"] = profession
+    if age:
+        c["age"] = age
+    if notes:
+        c["notes"] = notes
 
     if data.get("photo_before_url") is not None:
         c["photo_before_url"] = clean_str(data.get("photo_before_url") or "")
@@ -1238,7 +1276,7 @@ def admin_clients_upsert():
     save_clients()
     _recalc_counter_from_clients()
 
-    return jsonify({"ok": True, "id": cid, "item": c})
+    return jsonify({"ok": True, "id": cid, "created": created, "item": c})
 
 def _delete_client_internal(cid: str):
     existed = CLIENTS.pop(cid, None)
