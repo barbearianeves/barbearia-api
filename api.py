@@ -221,16 +221,24 @@ def _save_counter(counter):
         json.dump(counter, f, ensure_ascii=False)
     os.replace(tmp, CLIENT_ID_COUNTER_FILE)
 
-def _recalc_counter_from_clients():
+def _get_max_client_id() -> int:
     max_id = 0
     for cid in CLIENTS.keys():
         s = clean_str(cid)
         if s.isdigit():
-            max_id = max(max_id, int(s))
+            try:
+                max_id = max(max_id, int(s))
+            except Exception:
+                pass
+    return max_id
+
+def _recalc_counter_from_clients():
+    max_id = _get_max_client_id()
     counter = _load_counter()
-    if counter.get("next", 1) <= max_id:
-        counter["next"] = max_id + 1
-        _save_counter(counter)
+    next_id = int(counter.get("next", 1) or 1)
+    safe_next = max(max_id + 1, next_id, 1)
+    counter["next"] = safe_next
+    _save_counter(counter)
     return counter
 
 def _today_iso():
@@ -341,12 +349,18 @@ Barbearia
 # =========================
 def _next_client_id_str():
     global COUNTER
+
+    max_id = _get_max_client_id()
+
     if COUNTER is None:
         COUNTER = _load_counter()
-    cid = int(COUNTER.get("next", 1) or 1)
-    COUNTER["next"] = cid + 1
+
+    current_next = int(COUNTER.get("next", 1) or 1)
+    new_id = max(max_id + 1, current_next, 1)
+
+    COUNTER["next"] = new_id + 1
     _save_counter(COUNTER)
-    return str(cid)
+    return str(new_id)
 
 def _find_client_id_by_email_or_phone(email: str, phone: str, name: str = "") -> str:
     e = norm_email(email or "")
@@ -438,8 +452,8 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", 
 
     c["id"] = cid
 
-    # na página pública, se o cliente foi encontrado por email,
-    # só atualiza nome se estiver vazio ou se for o mesmo nome
+    # na página pública, se encontrou por email,
+    # não estraga o nome antigo com outro nome errado
     if source == "public_web" and cid in CLIENTS:
         old_name = clean_str(c.get("name") or "")
         new_name = clean_str(incoming.get("name") or "")
