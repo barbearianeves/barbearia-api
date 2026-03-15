@@ -1,4 +1,4 @@
-# api.py — Barbearia API (bookings + clientes + fotos)
+# api.py — Barbearia API (bookings + clientes + fotos) - versão reforçada
 # Start (Render):
 #   gunicorn -w 1 api:app --bind 0.0.0.0:$PORT
 
@@ -6,6 +6,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from collections import deque
 from datetime import date
+from threading import RLock
 import os
 import time
 import secrets
@@ -25,6 +26,8 @@ import requests
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+DB_LOCK = RLock()
+
 # =========================
 # CONFIG / SECRETS
 # =========================
@@ -42,7 +45,6 @@ BOOKINGS = {}
 CHANGES = deque(maxlen=20000)
 CLIENTS = {}
 
-# reset sempre permitido
 ALLOW_MULTI_RESET_SAME_DAY = int((os.environ.get("ALLOW_MULTI_RESET_SAME_DAY", "1") or "1").strip())
 
 # =========================
@@ -51,8 +53,11 @@ ALLOW_MULTI_RESET_SAME_DAY = int((os.environ.get("ALLOW_MULTI_RESET_SAME_DAY", "
 def now_id():
     return str(int(time.time() * 1_000_000)) + "-" + secrets.token_hex(3)
 
-def bad(msg, code=400):
-    return jsonify({"error": msg}), code
+def bad(msg, code=400, extra=None):
+    payload = {"error": msg}
+    if isinstance(extra, dict):
+        payload.update(extra)
+    return jsonify(payload), code
 
 def push_change(op, payload):
     CHANGES.append({"op": op, "payload": payload, "ts": int(time.time())})
@@ -128,6 +133,28 @@ def abs_url(u: str) -> str:
     if u.startswith("/"):
         return base + u
     return base + "/" + u
+
+def _now_ts():
+    return int(time.time())
+
+def _public_client_view(c: dict) -> dict:
+    before_u = clean_str(c.get("photo_before_url") or "")
+    after_u = clean_str(c.get("photo_after_url") or "")
+    return {
+        "id": str(c.get("id") or ""),
+        "name": clean_str(c.get("name") or ""),
+        "phone": norm_phone(c.get("phone") or ""),
+        "email": norm_email(c.get("email") or ""),
+        "profession": clean_str(c.get("profession") or ""),
+        "age": clean_str(c.get("age") or ""),
+        "notes": clean_str(c.get("notes") or ""),
+        "photo_before_url": abs_url(before_u) if before_u else "",
+        "photo_after_url": abs_url(after_u) if after_u else "",
+        "updated_at": int(c.get("updated_at") or 0),
+        "created_at": int(c.get("created_at") or 0),
+        "photo_before_at": int(c.get("photo_before_at") or 0),
+        "photo_after_at": int(c.get("photo_after_at") or 0),
+    }
 
 # =========================
 # STORAGE
@@ -352,7 +379,7 @@ Barbearia
         return False, f"{type(e).__name__}: {e}"
 
 # =========================
-# CLIENTES
+# CLIENTES / IDENTIDADE FORTE
 # =========================
 def _next_client_id_str():
     global COUNTER
@@ -369,116 +396,219 @@ def _next_client_id_str():
     _save_counter(COUNTER)
     return str(new_id)
 
-def _find_client_id_by_email_or_phone(email: str, phone: str, name: str = "") -> str:
+def _client_identity_hits(email: str, phone: str):
     e = norm_email(email or "")
     p = norm_phone(phone or "")
-    nn = norm_name(name or "")
+
+    by_email = ""
+    by_phone = ""
 
     if e:
         for cid, c in CLIENTS.items():
             if norm_email(c.get("email") or "") == e:
-                return str(cid)
+                by_email = str(cid)
+                break
 
     if p:
         for cid, c in CLIENTS.items():
             if norm_phone(c.get("phone") or "") == p:
-                return str(cid)
+                by_phone = str(cid)
+                break
 
-    if nn:
-        hits = []
-        for cid, c in CLIENTS.items():
-            if norm_name(c.get("name") or "") == nn:
-                hits.append(str(cid))
-        if len(hits) == 1:
-            return hits[0]
+    return by_email, by_phone
 
+def _find_unique_name_hit(name: str) -> str:
+    nn = norm_name(name or "")
+    if not nn:
+        return ""
+
+    hits = []
+    for cid, c in CLIENTS.items():
+        if norm_name(c.get("name") or "") == nn:
+            hits.append(str(cid))
+
+    if len(hits) == 1:
+        return hits[0]
     return ""
 
-def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = "", name: str = "") -> str:
-    cid = norm_client_id(incoming_id)
-    if cid:
-        return cid
-
-    hit = _find_client_id_by_email_or_phone(email, phone, name=name)
-    hit = norm_client_id(hit)
-    if hit and hit in CLIENTS:
-        return hit
-
-    return ""
-
-def _find_client_match_for_public_booking(name: str, phone: str, email: str) -> str:
+def _resolve_client_identity(email: str, phone: str, name: str = "", incoming_id: str = ""):
     """
-    Página pública:
-    - email exato => match
-    - telefone exato + nome igual => match
-    - senão => cria novo cliente
+    Resolve qual cliente deve ser usado.
+    Regras:
+    - se vier incoming_id, ele tem prioridade mas não pode conflitar com email/phone de outro cliente
+    - email e phone são identidades fortes
+    - se email e phone baterem em clientes diferentes => conflito 409
+    - nome só entra como fallback quando único
     """
-    e = norm_email(email)
-    p = norm_phone(phone)
-    nn = norm_name(name)
+    incoming_id = norm_client_id(incoming_id)
+    e = norm_email(email or "")
+    p = norm_phone(phone or "")
 
-    if e:
-        for cid, c in CLIENTS.items():
-            if norm_email(c.get("email") or "") == e:
-                return str(cid)
+    by_email, by_phone = _client_identity_hits(e, p)
 
-    if p and nn:
-        for cid, c in CLIENTS.items():
-            if norm_phone(c.get("phone") or "") == p and norm_name(c.get("name") or "") == nn:
-                return str(cid)
+    if by_email and by_phone and by_email != by_phone:
+        return {
+            "ok": False,
+            "code": 409,
+            "error": "Conflito de identidade: email e telefone pertencem a clientes diferentes.",
+            "by_email": by_email,
+            "by_phone": by_phone,
+        }
 
-    return ""
+    strong_hit = by_email or by_phone
 
-def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", source: str = "") -> str:
-    cid = norm_client_id(client_id)
-    source = clean_str(source)
+    if incoming_id:
+        if incoming_id not in CLIENTS:
+            return {
+                "ok": False,
+                "code": 404,
+                "error": "Cliente indicado não existe.",
+            }
 
-    if cid:
-        c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
-    else:
-        if source == "public_web":
-            hit = _find_client_match_for_public_booking(name, phone, email)
-        else:
-            hit = _find_client_id_by_email_or_phone(email, phone, name=name)
+        if strong_hit and strong_hit != incoming_id:
+            return {
+                "ok": False,
+                "code": 409,
+                "error": "Conflito de identidade: o client_id indicado não corresponde ao email/telefone.",
+                "incoming_id": incoming_id,
+                "matched_client_id": strong_hit,
+            }
 
-        hit = norm_client_id(hit)
-        if hit and hit in CLIENTS:
-            cid = hit
-            c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
-        else:
-            cid = _next_client_id_str()
-            c = {"id": cid, "created_at": int(time.time())}
+        return {
+            "ok": True,
+            "cid": incoming_id,
+            "reason": "incoming_id",
+        }
 
-    incoming = {
-        "name": clean_str(name),
-        "phone": norm_phone(phone or ""),
-        "email": norm_email(email or ""),
+    if strong_hit:
+        return {
+            "ok": True,
+            "cid": strong_hit,
+            "reason": "strong_identity",
+        }
+
+    name_hit = _find_unique_name_hit(name)
+    if name_hit:
+        return {
+            "ok": True,
+            "cid": name_hit,
+            "reason": "unique_name",
+        }
+
+    return {
+        "ok": True,
+        "cid": "",
+        "reason": "new",
     }
+
+def _assert_unique_identity_for_client(target_cid: str, email: str, phone: str):
+    """
+    Garante que email/telefone não pertencem a OUTRO cliente.
+    """
+    target_cid = norm_client_id(target_cid)
+    e = norm_email(email or "")
+    p = norm_phone(phone or "")
+
+    by_email, by_phone = _client_identity_hits(e, p)
+
+    if by_email and by_email != target_cid:
+        return {
+            "ok": False,
+            "code": 409,
+            "error": "Este email já pertence a outro cliente.",
+            "conflict_client_id": by_email,
+            "field": "email",
+        }
+
+    if by_phone and by_phone != target_cid:
+        return {
+            "ok": False,
+            "code": 409,
+            "error": "Este telefone já pertence a outro cliente.",
+            "conflict_client_id": by_phone,
+            "field": "phone",
+        }
+
+    return {"ok": True}
+
+def _create_or_update_client_strict(name: str, phone: str, email: str, client_id: str = "", source: str = "", extra=None):
+    """
+    Cria ou reaproveita cliente sem permitir ambiguidades.
+    """
+    name = clean_str(name)
+    phone = norm_phone(phone)
+    email = norm_email(email)
+    client_id = norm_client_id(client_id)
+    source = clean_str(source)
+    extra = extra or {}
+
+    resolution = _resolve_client_identity(email=email, phone=phone, name=name, incoming_id=client_id)
+    if not resolution.get("ok"):
+        return resolution
+
+    cid = norm_client_id(resolution.get("cid") or "")
+    now_ts = _now_ts()
+
+    if not cid:
+        cid = _next_client_id_str()
+        c = {"id": cid, "created_at": now_ts}
+    else:
+        c = CLIENTS.get(cid) or {"id": cid, "created_at": now_ts}
+
+    unique_check = _assert_unique_identity_for_client(cid, email, phone)
+    if not unique_check.get("ok"):
+        return unique_check
 
     c["id"] = cid
 
-    if source == "public_web" and cid in CLIENTS:
+    incoming = {
+        "name": name,
+        "phone": phone,
+        "email": email,
+    }
+
+    # Regra pública: não deixar um nome diferente estragar o cliente existente
+    if source == "public_web":
         old_name = clean_str(c.get("name") or "")
         new_name = clean_str(incoming.get("name") or "")
-
         if new_name:
             if not old_name or same_person_name(old_name, new_name):
                 c["name"] = new_name
 
         if incoming.get("phone"):
             c["phone"] = incoming["phone"]
-
         if incoming.get("email"):
             c["email"] = incoming["email"]
     else:
         merge_non_empty(c, incoming)
+        merge_non_empty(c, extra)
 
-    c["updated_at"] = int(time.time())
+    c["updated_at"] = now_ts
 
     CLIENTS[cid] = c
     save_clients()
     _recalc_counter_from_clients()
-    return cid
+
+    return {
+        "ok": True,
+        "cid": cid,
+        "item": c,
+        "reason": resolution.get("reason") or "",
+    }
+
+def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", source: str = ""):
+    with DB_LOCK:
+        res = _create_or_update_client_strict(
+            name=name,
+            phone=phone,
+            email=email,
+            client_id=client_id,
+            source=source,
+            extra={}
+        )
+        if not res.get("ok"):
+            return res
+        return {"ok": True, "cid": res["cid"]}
 
 # =========================
 # HOME / DEBUG
@@ -505,7 +635,7 @@ def home():
         "data_dir": DATA_DIR or "NO_DATA_DIR",
         "uploads_dir": UPLOADS_DIR or "NO_UPLOADS",
         "bridge_pc_base": BRIDGE_PC_BASE or "",
-        "render_external_url": clean_str(os.environ.get("RENDER_EXTERNAL_URL","") or ""),
+        "render_external_url": clean_str(os.environ.get("RENDER_EXTERNAL_URL", "") or ""),
         "allow_multi_reset_same_day": bool(ALLOW_MULTI_RESET_SAME_DAY),
         "smtp": {
             "from": FROM_EMAIL,
@@ -539,8 +669,8 @@ def debug_clients_raw():
     out = list(CLIENTS.values())
 
     def _k(x):
-        sid = clean_str(x.get("id",""))
-        return (clean_str(x.get("name","")).lower(), int(sid) if sid.isdigit() else 10**18, sid)
+        sid = clean_str(x.get("id", ""))
+        return (clean_str(x.get("name", "")).lower(), int(sid) if sid.isdigit() else 10**18, sid)
 
     out.sort(key=_k)
     return jsonify({"ok": True, "count": len(out), "items": out})
@@ -565,29 +695,14 @@ def bridge_clients():
         return bad("unauthorized", 401)
 
     items = []
-    for cid, c in CLIENTS.items():
-        before_u = clean_str(c.get("photo_before_url") or "")
-        after_u = clean_str(c.get("photo_after_url") or "")
-
-        items.append({
-            "id": str(c.get("id") or cid),
-            "name": clean_str(c.get("name") or ""),
-            "phone": norm_phone(c.get("phone") or ""),
-            "email": norm_email(c.get("email") or ""),
-            "profession": clean_str(c.get("profession") or ""),
-            "age": clean_str(c.get("age") or ""),
-            "notes": clean_str(c.get("notes") or ""),
-            "photo_before_url": abs_url(before_u) if before_u else "",
-            "photo_after_url": abs_url(after_u) if after_u else "",
-            "updated_at": int(c.get("updated_at") or 0),
-            "created_at": int(c.get("created_at") or 0),
-        })
+    for _, c in CLIENTS.items():
+        items.append(_public_client_view(c))
 
     def _sid(x):
-        s = clean_str(x.get("id",""))
+        s = clean_str(x.get("id", ""))
         return int(s) if s.isdigit() else 10**18
 
-    items.sort(key=lambda x: (x.get("name",""), _sid(x), str(x.get("id",""))))
+    items.sort(key=lambda x: (x.get("name", ""), _sid(x), str(x.get("id", ""))))
     return jsonify({"ok": True, "items": items})
 
 @app.get("/public/clients")
@@ -659,37 +774,47 @@ def book():
     incoming_client_id = clean_str(data.get("client_id", ""))
     created_via = clean_str(data.get("created_via", ""))
 
-    client_id = ensure_client_basic(
-        name=name,
-        phone=phone,
-        email=email,
-        client_id=incoming_client_id,
-        source=created_via
-    )
-    c = CLIENTS.get(client_id) or {}
+    with DB_LOCK:
+        client_res = ensure_client_basic(
+            name=name,
+            phone=phone,
+            email=email,
+            client_id=incoming_client_id,
+            source=created_via
+        )
 
-    item = {
-        "id": bid,
-        "name": clean_str(c.get("name") or name),
-        "phone": norm_phone(c.get("phone") or phone),
-        "email": norm_email(c.get("email") or email),
-        "service": clean_str(data.get("service", "")),
-        "barber": clean_str(data.get("barber", "")),
-        "date": clean_str(data.get("date", "")),
-        "time": t,
-        "dur": int(float(data.get("dur", 30))),
-        "notes": clean_str(data.get("notes", "")),
-        "status": "Marcado",
-        "client_id": client_id,
-        "client": clean_str(c.get("name") or name),
-        "created_at": int(time.time()),
-        "created_by": clean_str(data.get("created_by", "")),
-        "created_via": created_via,
-    }
+        if not client_res.get("ok"):
+            return bad(
+                client_res.get("error") or "Erro a resolver cliente.",
+                client_res.get("code", 400),
+                {k: v for k, v in client_res.items() if k not in ("ok",)}
+            )
 
-    BOOKINGS[bid] = item
-    save_bookings()
-    push_change("upsert", item)
+        client_id = client_res["cid"]
+        c = CLIENTS.get(client_id) or {}
+
+        item = {
+            "id": bid,
+            "name": clean_str(c.get("name") or name),
+            "phone": norm_phone(c.get("phone") or phone),
+            "email": norm_email(c.get("email") or email),
+            "service": clean_str(data.get("service", "")),
+            "barber": clean_str(data.get("barber", "")),
+            "date": clean_str(data.get("date", "")),
+            "time": t,
+            "dur": int(float(data.get("dur", 30))),
+            "notes": clean_str(data.get("notes", "")),
+            "status": "Marcado",
+            "client_id": client_id,
+            "client": clean_str(c.get("name") or name),
+            "created_at": _now_ts(),
+            "created_by": clean_str(data.get("created_by", "")),
+            "created_via": created_via,
+        }
+
+        BOOKINGS[bid] = item
+        save_bookings()
+        push_change("upsert", item)
 
     return jsonify({"ok": True, "id": bid, "client_id": client_id, "item": item})
 
@@ -746,21 +871,22 @@ def cancel_booking():
     if not phone:
         return bad("Telefone em falta")
 
-    b = BOOKINGS.get(bid)
-    if not b:
-        return bad("Marcação não encontrada", 404)
+    with DB_LOCK:
+        b = BOOKINGS.get(bid)
+        if not b:
+            return bad("Marcação não encontrada", 404)
 
-    if norm_phone(b.get("phone", "")) != phone:
-        return bad("Telefone não corresponde à marcação", 403)
+        if norm_phone(b.get("phone", "")) != phone:
+            return bad("Telefone não corresponde à marcação", 403)
 
-    if clean_str(b.get("status", "")) == "Cancelado":
-        return jsonify({"ok": True, "id": bid, "status": "Cancelado"})
+        if clean_str(b.get("status", "")) == "Cancelado":
+            return jsonify({"ok": True, "id": bid, "status": "Cancelado"})
 
-    BOOKINGS[bid]["status"] = "Cancelado"
-    BOOKINGS[bid]["cancelled_at"] = int(time.time())
+        BOOKINGS[bid]["status"] = "Cancelado"
+        BOOKINGS[bid]["cancelled_at"] = _now_ts()
 
-    save_bookings()
-    push_change("upsert", BOOKINGS[bid])
+        save_bookings()
+        push_change("upsert", BOOKINGS[bid])
 
     return jsonify({"ok": True, "id": bid, "status": "Cancelado"})
 
@@ -793,49 +919,55 @@ def sync():
         return bad("changes inválido")
 
     applied = 0
-    for ch in changes:
-        op = ch.get("op")
-        payload = ch.get("payload") or {}
-        bid = clean_str(payload.get("id") or "")
-        if not bid:
-            continue
+    with DB_LOCK:
+        for ch in changes:
+            op = ch.get("op")
+            payload = ch.get("payload") or {}
+            bid = clean_str(payload.get("id") or "")
+            if not bid:
+                continue
 
-        if op == "delete":
-            existed = bid in BOOKINGS
-            BOOKINGS.pop(bid, None)
-            if existed:
+            if op == "delete":
+                existed = bid in BOOKINGS
+                BOOKINGS.pop(bid, None)
+                if existed:
+                    save_bookings()
+                    push_change("delete", {"id": bid})
+                applied += 1
+
+            elif op == "upsert":
+                current = BOOKINGS.get(bid, {})
+                merged = {**current, **payload}
+
+                cid = norm_client_id(merged.get("client_id") or "")
+                merged["client_id"] = cid
+
+                if cid:
+                    client_res = ensure_client_basic(
+                        name=merged.get("name", ""),
+                        phone=merged.get("phone", ""),
+                        email=merged.get("email", ""),
+                        client_id=cid,
+                        source="bridge_sync"
+                    )
+                    if not client_res.get("ok"):
+                        continue
+
+                    cc = CLIENTS.get(cid) or {}
+                    if clean_str(cc.get("name") or ""):
+                        merged["name"] = clean_str(cc.get("name") or merged.get("name") or "")
+                        merged["client"] = clean_str(cc.get("name") or "")
+                    if clean_str(cc.get("phone") or ""):
+                        merged["phone"] = norm_phone(cc.get("phone") or "")
+                    if clean_str(cc.get("email") or ""):
+                        merged["email"] = norm_email(cc.get("email") or "")
+                else:
+                    merged["client"] = clean_str(merged.get("client") or "")
+
+                BOOKINGS[bid] = merged
                 save_bookings()
-                push_change("delete", {"id": bid})
-            applied += 1
-
-        elif op == "upsert":
-            current = BOOKINGS.get(bid, {})
-            merged = {**current, **payload}
-
-            cid = norm_client_id(merged.get("client_id") or "")
-            merged["client_id"] = cid
-
-            if cid:
-                ensure_client_basic(
-                    name=merged.get("name", ""),
-                    phone=merged.get("phone", ""),
-                    email=merged.get("email", ""),
-                    client_id=cid,
-                    source="bridge_sync"
-                )
-                cc = CLIENTS.get(cid) or {}
-                if clean_str(cc.get("name") or ""):
-                    merged["name"] = clean_str(cc.get("name") or merged.get("name") or "")
-                    merged["client"] = clean_str(cc.get("name") or "")
-                if clean_str(cc.get("phone") or ""):
-                    merged["phone"] = norm_phone(cc.get("phone") or "")
-                if clean_str(cc.get("email") or ""):
-                    merged["email"] = norm_email(cc.get("email") or "")
-
-            BOOKINGS[bid] = merged
-            save_bookings()
-            push_change("upsert", BOOKINGS[bid])
-            applied += 1
+                push_change("upsert", BOOKINGS[bid])
+                applied += 1
 
     return jsonify({"ok": True, "applied": applied})
 
@@ -851,45 +983,49 @@ def replace_all():
         return bad("items inválido")
 
     global BOOKINGS
-    BOOKINGS = {}
+    with DB_LOCK:
+        BOOKINGS = {}
 
-    for b in items:
-        bid = clean_str(b.get("id", ""))
-        if not bid:
-            continue
+        for b in items:
+            bid = clean_str(b.get("id", ""))
+            if not bid:
+                continue
 
-        cid = norm_client_id(b.get("client_id") or "")
-        b["client_id"] = cid
+            cid = norm_client_id(b.get("client_id") or "")
+            b["client_id"] = cid
 
-        if cid:
-            ensure_client_basic(
-                name=b.get("name", ""),
-                phone=b.get("phone", ""),
-                email=b.get("email", ""),
-                client_id=cid,
-                source="bridge_replace_all"
-            )
-            cc = CLIENTS.get(cid) or {}
-            if clean_str(cc.get("name") or ""):
-                b["name"] = clean_str(cc.get("name") or b.get("name") or "")
-                b["client"] = clean_str(cc.get("name") or "")
+            if cid:
+                client_res = ensure_client_basic(
+                    name=b.get("name", ""),
+                    phone=b.get("phone", ""),
+                    email=b.get("email", ""),
+                    client_id=cid,
+                    source="bridge_replace_all"
+                )
+                if not client_res.get("ok"):
+                    continue
+
+                cc = CLIENTS.get(cid) or {}
+                if clean_str(cc.get("name") or ""):
+                    b["name"] = clean_str(cc.get("name") or b.get("name") or "")
+                    b["client"] = clean_str(cc.get("name") or "")
+                else:
+                    b["client"] = clean_str(b.get("client") or "")
+                if clean_str(cc.get("phone") or ""):
+                    b["phone"] = norm_phone(cc.get("phone") or "")
+                if clean_str(cc.get("email") or ""):
+                    b["email"] = norm_email(cc.get("email") or "")
             else:
                 b["client"] = clean_str(b.get("client") or "")
-            if clean_str(cc.get("phone") or ""):
-                b["phone"] = norm_phone(cc.get("phone") or "")
-            if clean_str(cc.get("email") or ""):
-                b["email"] = norm_email(cc.get("email") or "")
-        else:
-            b["client"] = clean_str(b.get("client") or "")
 
-        BOOKINGS[bid] = b
+            BOOKINGS[bid] = b
 
-    save_bookings()
-    save_clients()
+        save_bookings()
+        save_clients()
 
-    CHANGES.clear()
-    for b in BOOKINGS.values():
-        push_change("upsert", b)
+        CHANGES.clear()
+        for b in BOOKINGS.values():
+            push_change("upsert", b)
 
     return jsonify({"ok": True, "count": len(BOOKINGS)})
 
@@ -974,11 +1110,12 @@ def admin_get_booking(bid):
 def admin_cancel(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-    if bid not in BOOKINGS:
-        return bad("not found", 404)
-    BOOKINGS[bid]["status"] = "Cancelado"
-    save_bookings()
-    push_change("upsert", BOOKINGS[bid])
+    with DB_LOCK:
+        if bid not in BOOKINGS:
+            return bad("not found", 404)
+        BOOKINGS[bid]["status"] = "Cancelado"
+        save_bookings()
+        push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
 @app.post("/admin/block")
@@ -994,61 +1131,78 @@ def admin_block():
     if not date_ or not time_ or not barber:
         return bad("Campos obrigatórios: date, time, barber")
 
-    bid = now_id()
-    item = {
-        "id": bid,
-        "name": "INDISPONÍVEL",
-        "phone": "",
-        "email": "",
-        "service": "INDISPONIVEL",
-        "barber": barber,
-        "date": date_,
-        "time": time_,
-        "dur": 45,
-        "notes": "",
-        "status": "Bloqueado",
-        "client_id": "",
-        "client": "INDISPONÍVEL",
-        "created_at": int(time.time()),
-        "created_by": "",
-        "created_via": "",
-    }
+    with DB_LOCK:
+        # impedir bloqueio duplicado exato ativo
+        for b in BOOKINGS.values():
+            if (
+                clean_str(b.get("date")) == date_
+                and clean_str(b.get("time")) == time_
+                and clean_str(b.get("barber")) == barber
+                and clean_str(b.get("status") or "Marcado") not in ("Cancelado", "Desbloqueado")
+            ):
+                return bad("Já existe uma marcação ou bloqueio ativo nesse horário.", 409)
 
-    BOOKINGS[bid] = item
-    save_bookings()
-    push_change("upsert", item)
+        bid = now_id()
+        item = {
+            "id": bid,
+            "name": "INDISPONÍVEL",
+            "phone": "",
+            "email": "",
+            "service": "INDISPONIVEL",
+            "barber": barber,
+            "date": date_,
+            "time": time_,
+            "dur": 45,
+            "notes": "",
+            "status": "Bloqueado",
+            "client_id": "",
+            "client": "INDISPONÍVEL",
+            "created_at": _now_ts(),
+            "created_by": "",
+            "created_via": "",
+        }
+
+        BOOKINGS[bid] = item
+        save_bookings()
+        push_change("upsert", item)
+
     return jsonify({"ok": True, "id": bid})
 
 @app.post("/admin/unblock/<bid>")
 def admin_unblock(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-    if bid not in BOOKINGS:
-        return bad("not found", 404)
-    BOOKINGS[bid]["status"] = "Desbloqueado"
-    save_bookings()
-    push_change("upsert", BOOKINGS[bid])
+    with DB_LOCK:
+        if bid not in BOOKINGS:
+            return bad("not found", 404)
+        BOOKINGS[bid]["status"] = "Desbloqueado"
+        save_bookings()
+        push_change("upsert", BOOKINGS[bid])
     return jsonify({"ok": True})
 
 @app.post("/admin/validate_and_email/<bid>")
 def admin_validate_and_email(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-    if bid not in BOOKINGS:
-        return bad("not found", 404)
 
     data = request.get_json(silent=True) or {}
     new_status = clean_str(data.get("status") or "Chegou")
 
-    incoming_email = clean_str(data.get("email") or "")
-    if incoming_email:
-        BOOKINGS[bid]["email"] = incoming_email
+    with DB_LOCK:
+        if bid not in BOOKINGS:
+            return bad("not found", 404)
 
-    BOOKINGS[bid]["status"] = new_status
-    save_bookings()
-    push_change("upsert", BOOKINGS[bid])
+        incoming_email = clean_str(data.get("email") or "")
+        if incoming_email:
+            BOOKINGS[bid]["email"] = norm_email(incoming_email)
 
-    ok, msg_email = send_validation_email(BOOKINGS[bid])
+        BOOKINGS[bid]["status"] = new_status
+        save_bookings()
+        push_change("upsert", BOOKINGS[bid])
+
+        booking_copy = dict(BOOKINGS[bid])
+
+    ok, msg_email = send_validation_email(booking_copy)
 
     return jsonify({
         "ok": True,
@@ -1061,27 +1215,50 @@ def admin_validate_and_email(bid):
 def admin_link_client(bid):
     if not is_admin(request):
         return bad("unauthorized", 401)
-    if bid not in BOOKINGS:
-        return bad("not found", 404)
 
     data = request.get_json(silent=True) or {}
     cid = norm_client_id(data.get("client_id") or "")
-    if not cid or cid not in CLIENTS:
-        return bad("cliente não encontrado", 404)
+    if not cid:
+        return bad("client_id inválido", 400)
 
-    BOOKINGS[bid]["client_id"] = cid
-    BOOKINGS[bid]["client"] = clean_str(CLIENTS[cid].get("name") or "")
+    with DB_LOCK:
+        if bid not in BOOKINGS:
+            return bad("not found", 404)
+        if cid not in CLIENTS:
+            return bad("cliente não encontrado", 404)
 
-    c = CLIENTS.get(cid) or {}
-    if clean_str(c.get("phone") or ""):
-        BOOKINGS[bid]["phone"] = norm_phone(c.get("phone") or "")
-    if clean_str(c.get("email") or ""):
-        BOOKINGS[bid]["email"] = norm_email(c.get("email") or "")
-    if clean_str(c.get("name") or ""):
-        BOOKINGS[bid]["name"] = clean_str(c.get("name") or "")
+        booking = BOOKINGS[bid]
+        client = CLIENTS[cid]
 
-    save_bookings()
-    push_change("upsert", BOOKINGS[bid])
+        b_email = norm_email(booking.get("email") or "")
+        b_phone = norm_phone(booking.get("phone") or "")
+
+        # se a marcação já trouxer identidade forte que aponta para outro cliente, bloquear
+        resolution = _resolve_client_identity(
+            email=b_email,
+            phone=b_phone,
+            name=booking.get("name", ""),
+            incoming_id=cid
+        )
+        if not resolution.get("ok"):
+            return bad(
+                resolution.get("error") or "Conflito ao ligar cliente.",
+                resolution.get("code", 409),
+                {k: v for k, v in resolution.items() if k not in ("ok",)}
+            )
+
+        BOOKINGS[bid]["client_id"] = cid
+        BOOKINGS[bid]["client"] = clean_str(client.get("name") or "")
+        if clean_str(client.get("phone") or ""):
+            BOOKINGS[bid]["phone"] = norm_phone(client.get("phone") or "")
+        if clean_str(client.get("email") or ""):
+            BOOKINGS[bid]["email"] = norm_email(client.get("email") or "")
+        if clean_str(client.get("name") or ""):
+            BOOKINGS[bid]["name"] = clean_str(client.get("name") or "")
+
+        save_bookings()
+        push_change("upsert", BOOKINGS[bid])
+
     return jsonify({"ok": True, "item": BOOKINGS[bid]})
 
 # =========================
@@ -1098,16 +1275,16 @@ def admin_clients_list():
     if q:
         def hit(c):
             return (
-                q in str(c.get("id","")).lower()
-                or q in clean_str(c.get("name","")).lower()
-                or q in clean_str(c.get("phone","")).lower()
-                or q in clean_str(c.get("email","")).lower()
+                q in str(c.get("id", "")).lower()
+                or q in clean_str(c.get("name", "")).lower()
+                or q in clean_str(c.get("phone", "")).lower()
+                or q in clean_str(c.get("email", "")).lower()
             )
         items = [c for c in items if hit(c)]
 
     def _k(x):
-        sid = clean_str(x.get("id",""))
-        return (clean_str(x.get("name","")).lower(), int(sid) if sid.isdigit() else 10**18, sid)
+        sid = clean_str(x.get("id", ""))
+        return (clean_str(x.get("name", "")).lower(), int(sid) if sid.isdigit() else 10**18, sid)
 
     items.sort(key=_k)
     return jsonify({
@@ -1153,34 +1330,35 @@ def admin_reset_clients():
     unlink_bookings = bool(data.get("unlink_bookings", False))
     delete_uploads = bool(data.get("delete_uploads", False))
 
-    deleted_clients = len(CLIENTS)
-    unlinked = 0
+    with DB_LOCK:
+        deleted_clients = len(CLIENTS)
+        unlinked = 0
 
-    CLIENTS.clear()
+        CLIENTS.clear()
 
-    if unlink_bookings:
-        for bid, b in BOOKINGS.items():
-            if norm_client_id(b.get("client_id") or ""):
-                b["client_id"] = ""
-                b["client"] = ""
-                unlinked += 1
-        save_bookings()
+        if unlink_bookings:
+            for _, b in BOOKINGS.items():
+                if norm_client_id(b.get("client_id") or ""):
+                    b["client_id"] = ""
+                    b["client"] = ""
+                    unlinked += 1
+            save_bookings()
 
-    if delete_uploads and UPLOADS_DIR:
-        try:
-            if os.path.isdir(UPLOADS_DIR):
-                shutil.rmtree(UPLOADS_DIR, ignore_errors=True)
-            os.makedirs(UPLOADS_DIR, exist_ok=True)
-        except Exception:
-            pass
+        if delete_uploads and UPLOADS_DIR:
+            try:
+                if os.path.isdir(UPLOADS_DIR):
+                    shutil.rmtree(UPLOADS_DIR, ignore_errors=True)
+                os.makedirs(UPLOADS_DIR, exist_ok=True)
+            except Exception:
+                pass
 
-    save_clients()
+        save_clients()
 
-    global COUNTER
-    COUNTER = {"next": 1}
-    _save_counter(COUNTER)
+        global COUNTER
+        COUNTER = {"next": 1}
+        _save_counter(COUNTER)
 
-    _save_reset_state({"last_reset_date": today})
+        _save_reset_state({"last_reset_date": today})
 
     return jsonify({
         "ok": True,
@@ -1198,8 +1376,8 @@ def admin_clients_upsert():
         return bad("unauthorized", 401)
 
     data = request.get_json(silent=True) or {}
-    incoming_id = norm_client_id(data.get("id") or "")
 
+    incoming_id = norm_client_id(data.get("id") or "")
     name = clean_str(data.get("name") or "")
     phone = norm_phone(data.get("phone") or "")
     email = norm_email(data.get("email") or "")
@@ -1207,39 +1385,36 @@ def admin_clients_upsert():
     age = clean_str(data.get("age") or "")
     notes = clean_str(data.get("notes") or "")
 
-    if incoming_id:
-        cid = incoming_id
-    else:
-        cid = _find_existing_client_for_upsert(email, phone, incoming_id="", name=name)
-        if not cid:
-            cid = _next_client_id_str()
-
-    c = CLIENTS.get(cid) or {"id": cid, "created_at": int(time.time())}
-    c["id"] = cid
-
-    incoming = {
-        "name": name,
-        "phone": phone,
-        "email": email,
+    extra = {
         "profession": profession,
         "age": age,
         "notes": notes,
     }
 
-    merge_non_empty(c, incoming)
+    with DB_LOCK:
+        res = _create_or_update_client_strict(
+            name=name,
+            phone=phone,
+            email=email,
+            client_id=incoming_id,
+            source="admin",
+            extra=extra
+        )
 
-    if data.get("photo_before_url") is not None:
-        c["photo_before_url"] = clean_str(data.get("photo_before_url") or "")
+        if not res.get("ok"):
+            return bad(
+                res.get("error") or "Erro a guardar cliente.",
+                res.get("code", 400),
+                {k: v for k, v in res.items() if k not in ("ok",)}
+            )
 
-    if data.get("photo_after_url") is not None:
-        c["photo_after_url"] = clean_str(data.get("photo_after_url") or "")
+        # Fotos NÃO são alteradas por este endpoint.
+        c = CLIENTS.get(res["cid"]) or {}
+        CLIENTS[res["cid"]] = c
+        save_clients()
+        _recalc_counter_from_clients()
 
-    c["updated_at"] = int(time.time())
-    CLIENTS[cid] = c
-    save_clients()
-    _recalc_counter_from_clients()
-
-    return jsonify({"ok": True, "id": cid, "item": c})
+    return jsonify({"ok": True, "id": res["cid"], "item": c})
 
 def _delete_client_internal(cid: str):
     existed = CLIENTS.pop(cid, None)
@@ -1253,7 +1428,7 @@ def _delete_client_internal(cid: str):
             pass
 
     changed = 0
-    for bid, b in BOOKINGS.items():
+    for _, b in BOOKINGS.items():
         if norm_client_id(b.get("client_id") or "") == cid:
             b["client_id"] = ""
             b["client"] = ""
@@ -1274,7 +1449,9 @@ def admin_client_delete(cid):
     if not cid or cid not in CLIENTS:
         return bad("not found", 404)
 
-    existed, changed = _delete_client_internal(cid)
+    with DB_LOCK:
+        existed, changed = _delete_client_internal(cid)
+
     return jsonify({"ok": True, "deleted": cid, "bookings_unlinked": changed, "item": existed})
 
 @app.post("/admin/client/<cid>/delete")
@@ -1285,7 +1462,9 @@ def admin_client_delete_post(cid):
     if not cid or cid not in CLIENTS:
         return bad("not found", 404)
 
-    existed, changed = _delete_client_internal(cid)
+    with DB_LOCK:
+        existed, changed = _delete_client_internal(cid)
+
     return jsonify({"ok": True, "deleted": cid, "bookings_unlinked": changed, "item": existed})
 
 @app.post("/admin/client/<cid>/photo")
@@ -1311,41 +1490,88 @@ def admin_client_upload_photo(cid):
     if not f or not f.filename:
         return bad("Ficheiro inválido")
 
-    c = CLIENTS.get(cid)
-    if not c:
-        return bad("cliente não encontrado", 404)
+    booking_id = clean_str(request.form.get("booking_id") or "")
 
-    ext = os.path.splitext(f.filename)[1].lower()
-    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]:
-        ext = ".jpg"
+    with DB_LOCK:
+        c = CLIENTS.get(cid)
+        if not c:
+            return bad("cliente não encontrado", 404)
 
-    client_dir = os.path.join(UPLOADS_DIR, cid)
-    os.makedirs(client_dir, exist_ok=True)
+        if booking_id:
+            b = BOOKINGS.get(booking_id)
+            if not b:
+                return bad("booking_id não encontrado", 404)
+            bcid = norm_client_id(b.get("client_id") or "")
+            if bcid and bcid != cid:
+                return bad("Esta marcação pertence a outro cliente.", 409, {
+                    "booking_id": booking_id,
+                    "booking_client_id": bcid,
+                    "target_client_id": cid,
+                })
 
-    ts = str(int(time.time()))
-    filename = f"{kind}-{ts}{ext}"
-    save_path = os.path.join(client_dir, filename)
-    f.save(save_path)
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]:
+            ext = ".jpg"
 
-    url = f"/files/{cid}/{filename}"
+        client_dir = os.path.join(UPLOADS_DIR, cid)
+        os.makedirs(client_dir, exist_ok=True)
 
-    if kind == "before":
-        c["photo_before_url"] = url
-        c["photo_before_at"] = int(time.time())
-    else:
-        c["photo_after_url"] = url
-        c["photo_after_at"] = int(time.time())
+        ts = str(_now_ts())
+        filename = f"{kind}-{ts}{ext}"
+        save_path = os.path.join(client_dir, filename)
+        f.save(save_path)
 
-    note = clean_str(request.form.get("note") or "")
-    if note:
-        c.setdefault("photo_notes", [])
-        c["photo_notes"].append({"kind": kind, "note": note, "ts": int(time.time())})
+        url = f"/files/{cid}/{filename}"
 
-    c["updated_at"] = int(time.time())
-    CLIENTS[cid] = c
-    save_clients()
+        if kind == "before":
+            c["photo_before_url"] = url
+            c["photo_before_at"] = _now_ts()
+        else:
+            c["photo_after_url"] = url
+            c["photo_after_at"] = _now_ts()
+
+        note = clean_str(request.form.get("note") or "")
+        if note:
+            c.setdefault("photo_notes", [])
+            c["photo_notes"].append({"kind": kind, "note": note, "ts": _now_ts()})
+
+        c["updated_at"] = _now_ts()
+        CLIENTS[cid] = c
+        save_clients()
 
     return jsonify({"ok": True, "url": url, "item": c})
+
+@app.post("/admin/client/<cid>/photo/delete")
+def admin_client_delete_photo(cid):
+    if not is_admin(request):
+        return bad("unauthorized", 401)
+
+    cid = norm_client_id(cid)
+    if not cid:
+        return bad("client id inválido", 400)
+
+    data = request.get_json(silent=True) or {}
+    kind = clean_str(data.get("kind") or "").lower()
+    if kind not in ("before", "after"):
+        return bad("kind inválido (before|after)")
+
+    with DB_LOCK:
+        c = CLIENTS.get(cid)
+        if not c:
+            return bad("cliente não encontrado", 404)
+
+        if kind == "before":
+            c["photo_before_url"] = ""
+            c["photo_before_at"] = 0
+        else:
+            c["photo_after_url"] = ""
+            c["photo_after_at"] = 0
+
+        c["updated_at"] = _now_ts()
+        CLIENTS[cid] = c
+        save_clients()
+
+    return jsonify({"ok": True, "item": c})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
