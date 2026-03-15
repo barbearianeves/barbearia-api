@@ -6,9 +6,17 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from collections import deque
 from datetime import date
-import os, time, secrets, json, shutil, re, unicodedata
+import os
+import time
+import secrets
+import json
+import shutil
+import re
+import unicodedata
 
-import smtplib, ssl, socket
+import smtplib
+import ssl
+import socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -21,18 +29,21 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # CONFIG / SECRETS
 # =========================
 BRIDGE_SECRET = (os.environ.get("BRIDGE_SECRET", "neves-12345") or "").strip()
-ADMIN_TOKEN   = (os.environ.get("ADMIN_TOKEN", "neves-12345") or "").strip()
+ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN", "neves-12345") or "").strip()
 BRIDGE_PC_BASE = (os.environ.get("BRIDGE_PC_BASE", "") or "").strip().rstrip("/")
 
 FROM_EMAIL = (os.environ.get("FROM_EMAIL", "") or "").strip() or (os.environ.get("SMTP_USER", "") or "").strip()
-SMTP_HOST  = (os.environ.get("SMTP_HOST", "smtp.gmail.com") or "").strip()
-SMTP_PORT  = int((os.environ.get("SMTP_PORT", "587") or "587").strip())
-SMTP_USER  = (os.environ.get("SMTP_USER", "") or "").strip() or FROM_EMAIL
-SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
+SMTP_HOST = (os.environ.get("SMTP_HOST", "smtp.gmail.com") or "").strip()
+SMTP_PORT = int((os.environ.get("SMTP_PORT", "587") or "587").strip())
+SMTP_USER = (os.environ.get("SMTP_USER", "") or "").strip() or FROM_EMAIL
+SMTP_PASS = (os.environ.get("SMTP_PASS", "") or "").strip()
 
 BOOKINGS = {}
-CHANGES  = deque(maxlen=20000)
-CLIENTS  = {}
+CHANGES = deque(maxlen=20000)
+CLIENTS = {}
+
+# reset sempre permitido
+ALLOW_MULTI_RESET_SAME_DAY = int((os.environ.get("ALLOW_MULTI_RESET_SAME_DAY", "1") or "1").strip())
 
 # =========================
 # HELPERS GERAIS
@@ -144,11 +155,9 @@ def pick_data_dir():
 
 DATA_DIR = pick_data_dir()
 BOOKINGS_FILE = os.path.join(DATA_DIR, "bookings.json") if DATA_DIR else None
-CLIENTS_FILE  = os.path.join(DATA_DIR, "clients.json") if DATA_DIR else None
+CLIENTS_FILE = os.path.join(DATA_DIR, "clients.json") if DATA_DIR else None
 CLIENT_ID_COUNTER_FILE = os.path.join(DATA_DIR, "client_id_counter.json") if DATA_DIR else None
 RESET_CLIENTS_STATE_FILE = os.path.join(DATA_DIR, "reset_clients_state.json") if DATA_DIR else None
-
-ALLOW_MULTI_RESET_SAME_DAY = int((os.environ.get("ALLOW_MULTI_RESET_SAME_DAY", "0") or "0"))
 
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads") if DATA_DIR else None
 if UPLOADS_DIR:
@@ -252,9 +261,7 @@ def _load_reset_state():
             with open(RESET_CLIENTS_STATE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
             if isinstance(d, dict):
-                return {
-                    "last_reset_date": clean_str(d.get("last_reset_date") or "")
-                }
+                return {"last_reset_date": clean_str(d.get("last_reset_date") or "")}
     except Exception:
         pass
     return {"last_reset_date": ""}
@@ -271,7 +278,7 @@ def _can_reset_clients_today():
     st = _load_reset_state()
     today = _today_iso()
     last = clean_str(st.get("last_reset_date") or "")
-    return last != today, last, today
+    return True, last, today
 
 COUNTER = None
 
@@ -389,7 +396,6 @@ def _find_client_id_by_email_or_phone(email: str, phone: str, name: str = "") ->
 
 def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = "", name: str = "") -> str:
     cid = norm_client_id(incoming_id)
-
     if cid:
         return cid
 
@@ -402,11 +408,10 @@ def _find_existing_client_for_upsert(email: str, phone: str, incoming_id: str = 
 
 def _find_client_match_for_public_booking(name: str, phone: str, email: str) -> str:
     """
-    Regras seguras para bookings da página pública:
+    Página pública:
     - email exato => match
     - telefone exato + nome igual => match
-    - nome sozinho => nunca
-    - telefone sozinho => nunca
+    - senão => cria novo cliente
     """
     e = norm_email(email)
     p = norm_phone(phone)
@@ -452,8 +457,6 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", 
 
     c["id"] = cid
 
-    # na página pública, se encontrou por email,
-    # não estraga o nome antigo com outro nome errado
     if source == "public_web" and cid in CLIENTS:
         old_name = clean_str(c.get("name") or "")
         new_name = clean_str(incoming.get("name") or "")
@@ -564,7 +567,7 @@ def bridge_clients():
     items = []
     for cid, c in CLIENTS.items():
         before_u = clean_str(c.get("photo_before_url") or "")
-        after_u  = clean_str(c.get("photo_after_url") or "")
+        after_u = clean_str(c.get("photo_after_url") or "")
 
         items.append({
             "id": str(c.get("id") or cid),
@@ -644,11 +647,14 @@ def book():
         if not clean_str(data.get(k, "")):
             return bad(f"Campo obrigatório em falta: {k}")
 
+    phone = norm_phone(data.get("phone", ""))
+    if not phone:
+        return bad("Campo obrigatório em falta: phone")
+
     t = clean_str(data["time"])[:5]
     bid = clean_str(data.get("id") or "") or now_id()
 
     name = clean_str(data.get("name", ""))
-    phone = norm_phone(data.get("phone", ""))
     email = norm_email(data.get("email", ""))
     incoming_client_id = clean_str(data.get("client_id", ""))
     created_via = clean_str(data.get("created_via", ""))
@@ -768,7 +774,7 @@ def pull():
         return bad("unauthorized", 401)
 
     cursor = int(request.args.get("cursor", "0"))
-    limit  = int(request.args.get("limit", "200"))
+    limit = int(request.args.get("limit", "200"))
 
     changes_list = list(CHANGES)
     out = changes_list[cursor: cursor + limit]
@@ -1104,7 +1110,11 @@ def admin_clients_list():
         return (clean_str(x.get("name","")).lower(), int(sid) if sid.isdigit() else 10**18, sid)
 
     items.sort(key=_k)
-    return jsonify({"ok": True, "count": len(items), "items": items})
+    return jsonify({
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    })
 
 @app.get("/admin/client/<cid>")
 def admin_client_get(cid):
@@ -1121,14 +1131,14 @@ def admin_reset_clients_status():
     if not is_admin(request):
         return bad("unauthorized", 401)
 
-    allowed, last_reset_date, today = _can_reset_clients_today()
+    _, last_reset_date, today = _can_reset_clients_today()
 
     return jsonify({
         "ok": True,
-        "allowed_today": bool(allowed or ALLOW_MULTI_RESET_SAME_DAY),
+        "allowed_today": True,
         "last_reset_date": last_reset_date,
         "today": today,
-        "override_enabled": bool(ALLOW_MULTI_RESET_SAME_DAY),
+        "override_enabled": True,
         "clients_count": len(CLIENTS),
     })
 
@@ -1137,14 +1147,7 @@ def admin_reset_clients():
     if not is_admin(request):
         return bad("unauthorized", 401)
 
-    allowed, last_reset_date, today = _can_reset_clients_today()
-    if not allowed and not ALLOW_MULTI_RESET_SAME_DAY:
-        return jsonify({
-            "ok": False,
-            "error": "reset_clients já foi usado hoje",
-            "last_reset_date": last_reset_date,
-            "today": today,
-        }), 429
+    _, _, today = _can_reset_clients_today()
 
     data = request.get_json(silent=True) or {}
     unlink_bookings = bool(data.get("unlink_bookings", False))
@@ -1177,9 +1180,7 @@ def admin_reset_clients():
     COUNTER = {"next": 1}
     _save_counter(COUNTER)
 
-    _save_reset_state({
-        "last_reset_date": today
-    })
+    _save_reset_state({"last_reset_date": today})
 
     return jsonify({
         "ok": True,
@@ -1188,7 +1189,7 @@ def admin_reset_clients():
         "uploads_reset": delete_uploads,
         "next_client_id": 1,
         "reset_date": today,
-        "override_enabled": bool(ALLOW_MULTI_RESET_SAME_DAY),
+        "override_enabled": True,
     })
 
 @app.post("/admin/clients")
@@ -1199,7 +1200,7 @@ def admin_clients_upsert():
     data = request.get_json(silent=True) or {}
     incoming_id = norm_client_id(data.get("id") or "")
 
-    name  = clean_str(data.get("name") or "")
+    name = clean_str(data.get("name") or "")
     phone = norm_phone(data.get("phone") or "")
     email = norm_email(data.get("email") or "")
     profession = clean_str(data.get("profession") or "")
