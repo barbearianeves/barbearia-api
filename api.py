@@ -32,7 +32,9 @@ SMTP_PASS  = (os.environ.get("SMTP_PASS", "") or "").strip()
 
 BOOKINGS = {}
 CHANGES  = deque(maxlen=20000)
-CLIENTS  = {}
+
+CLIENTS = {}
+CLIENT_CHANGES = deque(maxlen=20000)
 
 # =========================
 # HELPERS GERAIS
@@ -45,6 +47,9 @@ def bad(msg, code=400):
 
 def push_change(op, payload):
     CHANGES.append({"op": op, "payload": payload, "ts": int(time.time())})
+
+def push_client_change(op, payload):
+    CLIENT_CHANGES.append({"op": op, "payload": payload, "ts": int(time.time())})
 
 def is_admin(req):
     return (req.headers.get("X-Admin-Token", "") or "").strip() == ADMIN_TOKEN
@@ -287,6 +292,10 @@ CHANGES.clear()
 for b in BOOKINGS.values():
     push_change("upsert", b)
 
+CLIENT_CHANGES.clear()
+for c in CLIENTS.values():
+    push_client_change("upsert", c)
+
 # =========================
 # EMAIL
 # =========================
@@ -473,6 +482,7 @@ def ensure_client_basic(name: str, phone: str, email: str, client_id: str = "", 
     CLIENTS[cid] = c
     save_clients()
     _recalc_counter_from_clients()
+    push_client_change("upsert", c)
     return cid
 
 # =========================
@@ -495,6 +505,7 @@ def home():
         "bookings": len(BOOKINGS),
         "changes": len(CHANGES),
         "clients": len(CLIENTS),
+        "client_changes": len(CLIENT_CHANGES),
         "client_id_next": counter.get("next", None),
         "persist": BOOKINGS_FILE or "NO_PERSIST",
         "data_dir": DATA_DIR or "NO_DATA_DIR",
@@ -584,6 +595,105 @@ def bridge_clients():
 
     items.sort(key=lambda x: (x.get("name",""), _sid(x), str(x.get("id",""))))
     return jsonify({"ok": True, "items": items})
+
+@app.get("/bridge/clients/pull")
+def bridge_clients_pull():
+    secret = clean_str(request.args.get("secret", ""))
+    if secret != BRIDGE_SECRET:
+        return bad("unauthorized", 401)
+
+    cursor = int(request.args.get("cursor", "0"))
+    limit  = int(request.args.get("limit", "200"))
+
+    changes_list = list(CLIENT_CHANGES)
+    out = changes_list[cursor: cursor + limit]
+    new_cursor = min(cursor + len(out), len(changes_list))
+    return jsonify({"ok": True, "cursor": new_cursor, "items": out})
+
+@app.post("/bridge/clients/sync")
+def bridge_clients_sync():
+    secret = clean_str(request.args.get("secret", ""))
+    if secret != BRIDGE_SECRET:
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    changes = data.get("changes", [])
+    if not isinstance(changes, list):
+        return bad("changes inválido")
+
+    applied = 0
+
+    for ch in changes:
+        op = clean_str(ch.get("op") or "")
+        payload = ch.get("payload") or {}
+        cid = norm_client_id(payload.get("id") or "")
+        if not cid:
+            continue
+
+        if op == "delete":
+            existed = CLIENTS.pop(cid, None)
+
+            if UPLOADS_DIR:
+                p = os.path.join(UPLOADS_DIR, cid)
+                try:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                except Exception:
+                    pass
+
+            if existed is not None:
+                save_clients()
+                push_client_change("delete", {"id": cid})
+            applied += 1
+
+        elif op == "upsert":
+            current = CLIENTS.get(cid, {})
+            merged = {**current, **payload}
+            merged["id"] = cid
+            merged["phone"] = norm_phone(merged.get("phone") or "")
+            merged["email"] = norm_email(merged.get("email") or "")
+            merged["updated_at"] = int(merged.get("updated_at") or time.time())
+
+            CLIENTS[cid] = merged
+            save_clients()
+            _recalc_counter_from_clients()
+            push_client_change("upsert", merged)
+            applied += 1
+
+    return jsonify({"ok": True, "applied": applied})
+
+@app.post("/bridge/clients/replace_all")
+def bridge_clients_replace_all():
+    secret = clean_str(request.args.get("secret", ""))
+    if secret != BRIDGE_SECRET:
+        return bad("unauthorized", 401)
+
+    data = request.get_json(silent=True) or {}
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return bad("items inválido")
+
+    global CLIENTS
+    new_clients = {}
+
+    for c in items:
+        cid = norm_client_id(c.get("id") or "")
+        if not cid:
+            continue
+        c["id"] = cid
+        c["phone"] = norm_phone(c.get("phone") or "")
+        c["email"] = norm_email(c.get("email") or "")
+        new_clients[cid] = c
+
+    CLIENTS = new_clients
+    save_clients()
+    _recalc_counter_from_clients()
+
+    CLIENT_CHANGES.clear()
+    for c in CLIENTS.values():
+        push_client_change("upsert", c)
+
+    return jsonify({"ok": True, "count": len(CLIENTS)})
 
 @app.get("/public/clients")
 def public_clients():
@@ -1160,6 +1270,7 @@ def admin_reset_clients():
     unlink_bookings = bool(data.get("unlink_bookings", False))
     delete_uploads = bool(data.get("delete_uploads", False))
 
+    old_client_ids = list(CLIENTS.keys())
     deleted_clients = len(CLIENTS)
     unlinked = 0
 
@@ -1171,6 +1282,7 @@ def admin_reset_clients():
                 b["client_id"] = ""
                 b["client"] = ""
                 unlinked += 1
+                push_change("upsert", b)
         save_bookings()
 
     if delete_uploads and UPLOADS_DIR:
@@ -1182,6 +1294,9 @@ def admin_reset_clients():
             pass
 
     save_clients()
+
+    for cid in old_client_ids:
+        push_client_change("delete", {"id": cid})
 
     global COUNTER
     COUNTER = {"next": 1}
@@ -1228,8 +1343,6 @@ def admin_clients_upsert():
         cid = incoming_id
         c = CLIENTS.get(cid)
 
-        # CORREÇÃO:
-        # se vier id e ainda não existir, cria com ESSE id
         if not c:
             other_cid = _find_client_by_phone(phone)
             if other_cid and other_cid != cid:
@@ -1281,8 +1394,8 @@ def admin_clients_upsert():
     CLIENTS[cid] = c
     save_clients()
 
-    # garante que o próximo id automático fica acima do maior id existente
     _recalc_counter_from_clients()
+    push_client_change("upsert", c)
 
     return jsonify({"ok": True, "id": cid, "created": created, "item": c})
 
@@ -1303,9 +1416,11 @@ def _delete_client_internal(cid: str):
             b["client_id"] = ""
             b["client"] = ""
             changed += 1
+            push_change("upsert", b)
 
     if existed is not None:
         save_clients()
+        push_client_change("delete", {"id": cid})
     if changed:
         save_bookings()
 
@@ -1389,6 +1504,7 @@ def admin_client_upload_photo(cid):
     c["updated_at"] = int(time.time())
     CLIENTS[cid] = c
     save_clients()
+    push_client_change("upsert", c)
 
     return jsonify({"ok": True, "url": url, "item": c})
 
